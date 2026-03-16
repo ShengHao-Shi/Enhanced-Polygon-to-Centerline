@@ -271,17 +271,15 @@ class PolygonToCenterlineGDAL(object):
     def isLicensed(self):
         """
         The tool works with any ArcGIS licence level (Basic / Standard / Advanced).
-        All geometry operations are performed by open-source libraries.
+        All geometry operations are performed by open-source libraries; no
+        Standard/Advanced geoprocessing tools are called.
 
-        If required Python packages are missing, this method returns False and
-        ArcGIS Pro shows a warning in the tool dialog before the user clicks Run,
-        directing them to install the packages.
+        NOTE: Missing Python packages are reported via updateMessages() (a
+        parameter error on the input layer), not here.  Returning False from
+        isLicensed() would cause ArcGIS Pro to display the misleading
+        "Tool not licensed" message and lock the dialog, hiding the actual
+        install instructions from the user.
         """
-        if _MISSING_DEPS:
-            arcpy.AddWarning(
-                _INSTALL_HELP.format(missing=", ".join(_MISSING_DEPS))
-            )
-            return False
         return True
 
     # ------------------------------------------------------------------
@@ -302,6 +300,18 @@ class PolygonToCenterlineGDAL(object):
 
     def updateMessages(self, parameters):
         """Validate parameter values and surface any warnings."""
+
+        # If required packages are missing, set a visible error on the input
+        # feature parameter.  This surfaces the install instructions in the
+        # tool dialog and prevents the user from clicking Run, without
+        # triggering the misleading "Tool not licensed" lock that isLicensed()
+        # returning False would cause.
+        if _MISSING_DEPS:
+            parameters[0].setErrorMessage(
+                _INSTALL_HELP.format(missing=", ".join(_MISSING_DEPS))
+            )
+            return  # skip remaining validation while deps are absent
+
         for idx in (3, 4, 5):
             param = parameters[idx]
             if param.value is not None and float(param.value) < 0:
