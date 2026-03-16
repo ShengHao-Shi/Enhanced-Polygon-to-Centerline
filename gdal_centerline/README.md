@@ -317,8 +317,69 @@ cl_full   = polygon_to_centerline(gdf, densify_distance=0.5, single_line=False)
 
 ```
 gdal_centerline/
-├── centerline.py      Core algorithm (importable module)
-├── cli.py             Command-line interface
-├── requirements.txt   pip-compatible dependency list
-└── README.md          This file
+├── centerline.py          Core algorithm (importable module)
+├── cli.py                 Command-line interface
+├── GDAL_Centerline.pyt    ArcGIS Python Toolbox (wraps centerline.py)
+├── requirements.txt       pip-compatible dependency list
+└── README.md              This file
+```
+
+---
+
+## ArcGIS Toolbox (`GDAL_Centerline.pyt`)
+
+`GDAL_Centerline.pyt` is an **ArcGIS Python Toolbox** that provides a
+graphical dialog interface for `centerline.py` inside ArcGIS Pro or ArcCatalog.
+
+### Advantages over the ArcPy toolbox
+
+| Feature | ArcPy toolbox | GDAL toolbox |
+|---|---|---|
+| Required ArcGIS licence | **Standard or Advanced** | **Basic (any level)** |
+| Algorithm | Single Voronoi/Thiessen method | Voronoi *and* Skeleton |
+| Handles holes / rings | Partial | Yes (letter 'O', 'A', …) |
+| Dependencies | Only arcpy | geopandas, shapely, scipy, networkx |
+
+### How to load
+
+1. In **ArcGIS Pro** Catalog pane (or **ArcCatalog**), right-click the
+   `gdal_centerline/` folder → **Add Toolbox** → select `GDAL_Centerline.pyt`.
+2. Expand the toolbox and double-click **Polygon to Centerline (GDAL)**.
+
+`centerline.py` **must be in the same directory** as `GDAL_Centerline.pyt`
+(they are already co-located in this folder).
+
+### Tool parameters
+
+| # | Parameter | Default | Notes |
+|---|---|---|---|
+| 1 | Input Polygon Features | — | Any polygon layer / feature class |
+| 2 | Output Centerline Features | — | New polyline feature class |
+| 3 | Method | `voronoi` | `voronoi` or `skeleton` |
+| 4 | Densification Distance | `1.0` | CRS units; smaller = finer detail |
+| 5 | Branch Prune Threshold | `0.0` | Voronoi only; removes short stubs |
+| 6 | Gaussian Smooth Sigma | `0.0` | Skeleton only; 0 = no smoothing |
+| 7 | Raster Resolution Override | *(blank)* | Skeleton only; blank = auto |
+| 8 | Return Full Skeleton | ☐ (off) | When on, returns branches/forks |
+
+Parameters 5 (Prune Threshold) and 6–7 (Skeleton options) are automatically
+**enabled or disabled** based on the selected Method.
+
+### Output fields
+
+The output feature class contains all attribute fields from the input polygon
+plus one additional field:
+
+| Field | Type | Description |
+|---|---|---|
+| `ORIG_FID` | Long | Object ID of the source polygon feature |
+
+### Installing dependencies in ArcGIS Pro
+
+Open the ArcGIS Pro **Python Command Prompt** and run:
+
+```bash
+conda install -c conda-forge geopandas shapely scipy networkx
+# For method="skeleton" also install:
+conda install -c conda-forge scikit-image
 ```
