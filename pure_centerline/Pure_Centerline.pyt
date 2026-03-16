@@ -195,7 +195,6 @@ class PolygonToCenterlinePure(object):
             parameterType="Required",
             direction="Output",
         )
-        p_out.filter.list = ["Polyline"]
 
         # 2 — Algorithm method
         p_method = arcpy.Parameter(
