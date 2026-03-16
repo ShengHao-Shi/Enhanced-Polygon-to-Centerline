@@ -1,0 +1,490 @@
+# -*- coding: utf-8 -*-
+"""
+Fast_Centerline.pyt
+===================
+ArcGIS Python Toolbox that wraps the accelerated, shapely-free centerline
+algorithm implemented in ``centerline_fast.py``.
+
+Why use this toolbox instead of ``pure_centerline/Pure_Centerline.pyt``?
+------------------------------------------------------------------------
+Both toolboxes share the same shapely-free design (no shapely, geopandas,
+or pandas), so neither triggers the "Tool not licensed" dependency conflict
+that plagued ``gdal_centerline/GDAL_Centerline.pyt``.
+
+This toolbox is significantly faster on large or densely-sampled polygons
+because every geometry computation is performed with vectorised NumPy array
+operations rather than Python loops.  See ``centerline_fast.py`` for a
+detailed breakdown of all four acceleration techniques.
+
+Runtime dependencies
+--------------------
+Same as ``pure_centerline``:
+    numpy    – pre-installed in every ArcGIS Pro Python environment.
+    scipy    – usually pre-installed in ArcGIS Pro.
+    networkx – install from conda-forge (see install_dependencies.bat):
+                   conda install -c conda-forge networkx
+
+Optional (recommended for fastest rasterisation):
+    matplotlib – usually pre-installed in ArcGIS Pro.
+
+For ``method=skeleton`` also install scikit-image:
+                   conda install -c conda-forge scikit-image
+
+How to load this toolbox
+------------------------
+In **ArcGIS Pro** (Catalog pane) or **ArcCatalog**:
+  1. Right-click a folder → Add Toolbox → select ``Fast_Centerline.pyt``.
+  2. Expand the toolbox and run **Polygon to Centerline (Fast)**.
+
+``centerline_fast.py`` must be in the **same directory** as this ``.pyt``
+file so that it can be imported at run-time.
+"""
+
+import os
+import sys
+
+import arcpy
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+_SYSTEM_FIELDS = frozenset({
+    "SHAPE", "SHAPE_LENGTH", "SHAPE_AREA",
+    "SHAPE.STLENGTH()", "SHAPE.STAREA()",
+})
+
+_ARCPY_FIELD_TYPE_MAP = {
+    "SmallInteger":    "SHORT",
+    "Integer":         "LONG",
+    "BigInteger":      "BIG_INTEGER",
+    "Single":          "FLOAT",
+    "Double":          "DOUBLE",
+    "String":          "TEXT",
+    "Date":            "DATE",
+    "DateOnly":        "DATE_ONLY",
+    "TimeOnly":        "TIME_ONLY",
+    "TimestampOffset": "TIMESTAMP_OFFSET",
+    "GUID":            "GUID",
+    "GlobalID":        "GUID",
+    "Raster":          "TEXT",
+    "Blob":            "TEXT",
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight dependency check
+# ---------------------------------------------------------------------------
+
+
+def _check_dependencies():
+    """Return a list of package names that are NOT importable."""
+    _required = [
+        ("scipy",    "scipy"),
+        ("numpy",    "numpy"),
+        ("networkx", "networkx"),
+    ]
+    missing = []
+    for pkg_name, import_name in _required:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg_name)
+    return missing
+
+
+_MISSING_DEPS = _check_dependencies()
+
+_INSTALL_HELP = (
+    "\n"
+    "REQUIRED PACKAGES ARE NOT INSTALLED\n"
+    "====================================\n"
+    "Missing: {missing}\n"
+    "\n"
+    "Quick fix — run 'install_dependencies.bat' found in the same\n"
+    "folder as this toolbox (fast_centerline/).  See README.md for\n"
+    "full instructions.\n"
+    "\n"
+    "Manual installation (ArcGIS Pro Python Command Prompt):\n"
+    "\n"
+    "  Step 1 — Clone the default environment (only once):\n"
+    "    conda create --name arcgispro-py3-fast --clone arcgispro-py3\n"
+    "\n"
+    "  Step 2 — Install networkx into the clone:\n"
+    "    activate arcgispro-py3-fast\n"
+    "    conda install -c conda-forge -y networkx\n"
+    "\n"
+    "  Step 3 — Set the clone as the active environment in ArcGIS Pro:\n"
+    "    Project > Python > Python Environments > arcgispro-py3-fast\n"
+    "    Restart ArcGIS Pro.\n"
+    "\n"
+    "  Note: numpy and scipy are usually already present in the default\n"
+    "  'arcgispro-py3' environment.  matplotlib is also usually present\n"
+    "  and further accelerates rasterisation (no extra install needed).\n"
+)
+
+# ---------------------------------------------------------------------------
+# Toolbox
+# ---------------------------------------------------------------------------
+
+
+class Toolbox(object):
+    def __init__(self):
+        """Define the toolbox (the name of the toolbox is the name of the .pyt file)."""
+        self.label = "Fast Centerline"
+        self.alias = "FastCenterline"
+        self.tools = [PolygonToCenterlineFast]
+
+
+# ---------------------------------------------------------------------------
+# Tool definition
+# ---------------------------------------------------------------------------
+
+
+class PolygonToCenterlineFast(object):
+    """ArcGIS tool that wraps the accelerated polygon_to_centerline_wkt()."""
+
+    def __init__(self):
+        self.label = "Polygon to Centerline (Fast)"
+        self.description = (
+            "Converts polygon features to centerline polylines using an "
+            "accelerated, shapely-free open-source implementation.\n\n"
+            "This tool is significantly faster than 'Polygon to Centerline (Pure)' "
+            "on large or densely-sampled polygons because all geometry operations "
+            "are performed with vectorised NumPy array operations instead of "
+            "Python loops.\n\n"
+            "Four acceleration techniques are used:\n"
+            "  1. Vectorised densification (numpy arange/broadcasting replaces the\n"
+            "     innermost interpolation loop).\n"
+            "  2. Batch Voronoi ridge filtering — all M ridges are tested against\n"
+            "     all K ring edges in a single (M x K) numpy broadcast; no Python\n"
+            "     loop over ridges.\n"
+            "  3. Vectorised rasterisation — all pixels tested at once using\n"
+            "     matplotlib.path.Path (C extension) or numpy 2-D broadcast.\n"
+            "  4. Vectorised skeleton graph construction — edge discovery via numpy\n"
+            "     shift-and-intersect; all edges added in one batch call.\n\n"
+            "Like the Pure toolbox, this tool requires only numpy (pre-installed),\n"
+            "scipy (usually pre-installed), and networkx (conda-forge).  No shapely,\n"
+            "geopandas, or pandas are required, so it works with any ArcGIS licence\n"
+            "level (Basic / Standard / Advanced) without dependency conflicts.\n\n"
+            "Two algorithms:\n"
+            "  voronoi  — Vector-based Voronoi / Thiessen skeleton (default).\n"
+            "  skeleton — Raster-based morphological thinning (requires scikit-image)."
+        )
+        self.canRunInBackground = True
+
+    # ------------------------------------------------------------------
+    # Parameters
+    # ------------------------------------------------------------------
+
+    def getParameterInfo(self):
+        """Define the tool parameters."""
+
+        p_in = arcpy.Parameter(
+            displayName="Input Polygon Features",
+            name="in_features",
+            datatype="GPFeatureLayer",
+            parameterType="Required",
+            direction="Input",
+        )
+        p_in.filter.list = ["Polygon"]
+
+        p_out = arcpy.Parameter(
+            displayName="Output Centerline Features",
+            name="out_features",
+            datatype="DEFeatureClass",
+            parameterType="Required",
+            direction="Output",
+        )
+
+        p_method = arcpy.Parameter(
+            displayName="Method",
+            name="method",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input",
+        )
+        p_method.filter.type = "ValueList"
+        p_method.filter.list = ["voronoi", "skeleton"]
+        p_method.value = "voronoi"
+
+        p_densify = arcpy.Parameter(
+            displayName="Densification Distance (CRS units)",
+            name="densify_distance",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+        )
+        p_densify.value = 1.0
+
+        p_prune = arcpy.Parameter(
+            displayName="Branch Prune Threshold (CRS units; 0 = no pruning)",
+            name="prune_threshold",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+        )
+        p_prune.value = 0.0
+        p_prune.category = "Voronoi Options"
+
+        p_smooth = arcpy.Parameter(
+            displayName="Gaussian Smooth Sigma (CRS units; 0 = no smoothing)",
+            name="smooth_sigma",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+        )
+        p_smooth.value = 0.0
+        p_smooth.category = "Skeleton Options"
+
+        p_res = arcpy.Parameter(
+            displayName="Raster Resolution Override (CRS units; blank = auto)",
+            name="raster_resolution",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input",
+        )
+        p_res.category = "Skeleton Options"
+
+        p_full = arcpy.Parameter(
+            displayName="Return Full Skeleton (may contain branches / forks)",
+            name="full_skeleton",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input",
+        )
+        p_full.value = False
+
+        return [p_in, p_out, p_method, p_densify, p_prune, p_smooth, p_res, p_full]
+
+    # ------------------------------------------------------------------
+    # Licensing
+    # ------------------------------------------------------------------
+
+    def isLicensed(self):
+        """Works with any ArcGIS licence level — see updateMessages for dep errors."""
+        return True
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def updateParameters(self, parameters):
+        method = parameters[2].valueAsText or "voronoi"
+        parameters[4].enabled = method == "voronoi"
+        parameters[5].enabled = method == "skeleton"
+        parameters[6].enabled = method == "skeleton"
+
+    def updateMessages(self, parameters):
+        if _MISSING_DEPS:
+            parameters[0].setErrorMessage(
+                _INSTALL_HELP.format(missing=", ".join(_MISSING_DEPS))
+            )
+            return
+
+        for idx in (3, 4, 5):
+            param = parameters[idx]
+            if param.value is not None and float(param.value) < 0:
+                param.setErrorMessage("Value must be >= 0.")
+
+        res_param = parameters[6]
+        if res_param.value is not None and float(res_param.value) <= 0:
+            res_param.setErrorMessage("Raster Resolution must be > 0.")
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+
+    def execute(self, parameters, messages):
+        """Run the fast centerline algorithm."""
+
+        tbx_dir = os.path.dirname(os.path.abspath(__file__))
+        if tbx_dir not in sys.path:
+            sys.path.insert(0, tbx_dir)
+
+        # ---- Unpack parameters -------------------------------------------
+        in_features = parameters[0].valueAsText
+        out_features = parameters[1].valueAsText
+        method = parameters[2].valueAsText or "voronoi"
+        densify_distance = (
+            float(parameters[3].value) if parameters[3].value is not None else 1.0
+        )
+        prune_threshold = (
+            float(parameters[4].value) if parameters[4].value is not None else 0.0
+        )
+        smooth_sigma = (
+            float(parameters[5].value) if parameters[5].value is not None else 0.0
+        )
+        raster_resolution = (
+            float(parameters[6].value) if parameters[6].value is not None else None
+        )
+        single_line = not bool(parameters[7].value)
+
+        # ---- Import fast algorithm -----------------------------------------
+        try:
+            from centerline_fast import polygon_to_centerline_wkt
+        except ImportError:
+            messages.addErrorMessage(
+                "Could not import 'centerline_fast' module.\n"
+                "Ensure 'centerline_fast.py' is in the same folder as this toolbox:\n"
+                "  {}".format(tbx_dir)
+            )
+            raise
+
+        if _MISSING_DEPS:
+            messages.addErrorMessage(
+                _INSTALL_HELP.format(missing=", ".join(_MISSING_DEPS))
+            )
+            raise RuntimeError(
+                "Missing required packages: {}".format(", ".join(_MISSING_DEPS))
+            )
+
+        # ---- Read input polygons -------------------------------------------
+        messages.addMessage("Step 1/3  Reading input polygon features ...")
+
+        desc = arcpy.Describe(in_features)
+        spatial_ref = desc.spatialReference
+        oid_field = desc.OIDFieldName
+
+        _skip_upper = _SYSTEM_FIELDS | {oid_field.upper()}
+        attr_fields = [
+            f for f in arcpy.ListFields(in_features)
+            if f.type not in ("OID", "Geometry")
+            and f.name.upper() not in _skip_upper
+        ]
+        attr_field_names = [f.name for f in attr_fields]
+        cursor_fields = ["OID@", "SHAPE@WKT"] + attr_field_names
+
+        input_rows = []
+        with arcpy.da.SearchCursor(in_features, cursor_fields) as cursor:
+            for row in cursor:
+                input_rows.append(row)
+
+        messages.addMessage(
+            "         {:,} polygon(s) read.".format(len(input_rows))
+        )
+
+        if not input_rows:
+            messages.addWarningMessage("No polygon features found.")
+            return
+
+        # ---- Compute centerlines ------------------------------------------
+        messages.addMessage(
+            "Step 2/3  Computing centerlines "
+            "(method={}, densify={}) ...".format(method, densify_distance)
+        )
+
+        results = []
+        n_skipped = 0
+
+        for row in input_rows:
+            orig_fid = row[0]
+            wkt = row[1]
+            attr_dict = {
+                name: val for name, val in zip(attr_field_names, row[2:])
+            }
+
+            if not wkt:
+                n_skipped += 1
+                continue
+
+            try:
+                result_wkt = polygon_to_centerline_wkt(
+                    wkt,
+                    method=method,
+                    densify_distance=densify_distance,
+                    prune_threshold=prune_threshold,
+                    smooth_sigma=smooth_sigma,
+                    raster_resolution=raster_resolution,
+                    single_line=single_line,
+                )
+            except Exception as exc:
+                messages.addWarningMessage(
+                    "Skipping FID {}: {}".format(orig_fid, exc)
+                )
+                n_skipped += 1
+                result_wkt = None
+
+            if result_wkt:
+                results.append((result_wkt, orig_fid, attr_dict))
+            else:
+                n_skipped += 1
+
+        n_out = len(results)
+        messages.addMessage(
+            "         {:,} centerline(s) generated{}.".format(
+                n_out,
+                " ({:,} polygon(s) skipped)".format(n_skipped)
+                if n_skipped > 0 else "",
+            )
+        )
+
+        if n_out == 0:
+            messages.addWarningMessage(
+                "No centerlines were generated.  "
+                "Try a smaller Densification Distance."
+            )
+            return
+
+        # ---- Write output -------------------------------------------------
+        messages.addMessage("Step 3/3  Writing output feature class ...")
+
+        out_dir = os.path.dirname(out_features)
+        out_name = os.path.basename(out_features)
+        if not out_dir:
+            out_dir = arcpy.env.scratchGDB
+
+        arcpy.management.CreateFeatureclass(
+            out_dir, out_name, "POLYLINE",
+            spatial_reference=(
+                spatial_ref
+                if (spatial_ref and spatial_ref.name != "Unknown")
+                else None
+            ),
+        )
+        arcpy.env.overwriteOutput = True
+
+        arcpy.management.AddField(
+            out_features, "ORIG_FID", "LONG",
+            field_alias="Original Feature ID",
+        )
+
+        existing_out_field_names = {
+            f.name.upper() for f in arcpy.ListFields(out_features)
+        }
+        fields_to_add = []
+        for src_field in attr_fields:
+            fname = src_field.name
+            if fname.upper() not in existing_out_field_names:
+                ftype = _ARCPY_FIELD_TYPE_MAP.get(src_field.type, "TEXT")
+                fl = src_field.length if src_field.type == "String" else None
+                try:
+                    if fl:
+                        arcpy.management.AddField(
+                            out_features, fname, ftype, field_length=fl
+                        )
+                    else:
+                        arcpy.management.AddField(out_features, fname, ftype)
+                    fields_to_add.append(fname)
+                    existing_out_field_names.add(fname.upper())
+                except Exception:
+                    pass
+            else:
+                fields_to_add.append(fname)
+
+        _field_type_by_name = {f.name: f.type for f in attr_fields}
+        insert_fields = ["SHAPE@WKT", "ORIG_FID"] + fields_to_add
+
+        with arcpy.da.InsertCursor(out_features, insert_fields) as cursor:
+            for result_wkt, orig_fid, attr_dict in results:
+                attr_vals = [
+                    str(attr_dict.get(f))
+                    if _field_type_by_name.get(f) == "String"
+                    else attr_dict.get(f)
+                    for f in fields_to_add
+                ]
+                cursor.insertRow([result_wkt, orig_fid] + attr_vals)
+
+        messages.addMessage("Done.  Output saved to: {}".format(out_features))
+
+    def postExecute(self, parameters):
+        return

@@ -1,0 +1,9 @@
+numpy>=1.24
+scipy>=1.10
+networkx>=3.0
+
+# Optional — further accelerates rasterisation (usually pre-installed in ArcGIS Pro):
+# matplotlib>=3.5
+
+# Optional — only needed for method="skeleton":
+# scikit-image>=0.21
