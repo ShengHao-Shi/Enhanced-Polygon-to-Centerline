@@ -377,7 +377,8 @@ class PolygonToCenterlineFast(object):
         )
 
         n_total = len(input_rows)
-        arcpy.SetProgressor("default", "Computing centerlines ...")
+        arcpy.SetProgressor("step", "Computing centerlines ...", 0, 100, 1)
+        arcpy.SetProgressorPosition(5)
 
         # Progress callback factory — captures messages, t0, n_total from
         # the enclosing scope; poly_i and poly_fid are bound per-polygon
@@ -391,6 +392,12 @@ class PolygonToCenterlineFast(object):
                 messages.addMessage(
                     "  [{:.1f}s] {}".format(elapsed, label))
                 arcpy.SetProgressorLabel(label)
+                if pct >= 0:
+                    # Map per-polygon pct (0-100) into the overall 5%-90%
+                    # range allocated to Step 2.
+                    overall = 5 + int(
+                        (poly_i + pct / 100.0) * 85.0 / n_total)
+                    arcpy.SetProgressorPosition(min(overall, 90))
             return _cb
 
         results = []
@@ -450,6 +457,7 @@ class PolygonToCenterlineFast(object):
             return
 
         # ---- Write output -------------------------------------------------
+        arcpy.SetProgressorPosition(90)
         messages.addMessage("Step 3/3  Writing output feature class ...")
 
         out_dir = os.path.dirname(out_features)
@@ -511,6 +519,7 @@ class PolygonToCenterlineFast(object):
         messages.addMessage(
             "Done.  Output saved to: {} [{:.1f}s total]".format(
                 out_features, time.time() - t0))
+        arcpy.SetProgressorPosition(100)
         arcpy.ResetProgressor()
 
     def postExecute(self, parameters):

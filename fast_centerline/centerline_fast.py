@@ -287,7 +287,15 @@ def _paths_to_wkt(paths: list) -> Optional[str]:
 
 
 def _compute_perimeter(exterior: np.ndarray, holes: list) -> float:
-    """Sum of edge lengths across all polygon rings."""
+    """Sum of edge lengths across all polygon rings.
+
+    Parameters
+    ----------
+    exterior : np.ndarray, shape (N, 2)
+        Closed exterior ring coordinates.
+    holes : list of np.ndarray
+        Each element is an (M, 2) closed hole ring.
+    """
     total = 0.0
     for ring in [exterior] + holes:
         if len(ring) < 2:
