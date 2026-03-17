@@ -685,6 +685,7 @@ def _centerline_voronoi_fast(
     prune_threshold: float,
     single_line: bool = True,
     progress_callback=None,
+    max_densify_points: int = _MAX_DENSIFY_POINTS,
 ):
     """
     Compute the polygon centerline using a Voronoi skeleton — fully vectorised.
@@ -716,19 +717,19 @@ def _centerline_voronoi_fast(
     estimated_pts = perimeter / densify_distance
     actual_distance = densify_distance
 
-    if estimated_pts > _MAX_DENSIFY_POINTS:
-        actual_distance = perimeter / _MAX_DENSIFY_POINTS
+    if estimated_pts > max_densify_points:
+        actual_distance = perimeter / max_densify_points
         _report(
             "Auto-adjusting densify distance from {:.4g} to {:.4g} "
             "(perimeter {:.0f}; capped at {:,} points).".format(
                 densify_distance, actual_distance, perimeter,
-                _MAX_DENSIFY_POINTS),
+                max_densify_points),
             0,
         )
         warnings.warn(
             "Densification distance auto-increased from {:.4g} to {:.4g} "
             "to keep point count below {:,} (polygon perimeter = {:.0f}).".format(
-                densify_distance, actual_distance, _MAX_DENSIFY_POINTS,
+                densify_distance, actual_distance, max_densify_points,
                 perimeter),
             stacklevel=3,
         )
@@ -1037,6 +1038,7 @@ def polygon_to_centerline_wkt(
     raster_resolution: Optional[float] = None,
     single_line: bool = True,
     progress_callback=None,
+    max_densify_points: int = _MAX_DENSIFY_POINTS,
 ) -> Optional[str]:
     """
     Convert a polygon WKT string to a centerline WKT string — accelerated.
@@ -1058,6 +1060,10 @@ def polygon_to_centerline_wkt(
         *percentage* is an integer 0–100 (or -1 if indeterminate).
         The callback may be used by the ArcGIS Toolbox to update the
         progressor label and display elapsed time.
+    max_densify_points : int
+        Maximum number of densified boundary points before adaptive
+        adjustment increases ``densify_distance`` automatically (Plan D).
+        Default is 100,000.
 
     Returns
     -------
@@ -1079,6 +1085,7 @@ def polygon_to_centerline_wkt(
                     exterior, holes, densify_distance, prune_threshold,
                     single_line,
                     progress_callback=progress_callback,
+                    max_densify_points=max_densify_points,
                 )
             elif method == "skeleton":
                 res = raster_resolution if raster_resolution else densify_distance

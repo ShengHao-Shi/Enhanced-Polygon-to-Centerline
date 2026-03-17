@@ -255,7 +255,17 @@ class PolygonToCenterlineFast(object):
         )
         p_full.value = False
 
-        return [p_in, p_out, p_method, p_densify, p_prune, p_smooth, p_res, p_full]
+        p_max_pts = arcpy.Parameter(
+            displayName="Max Densify Points (adaptive cap for large polygons)",
+            name="max_densify_points",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input",
+        )
+        p_max_pts.value = 100000
+        p_max_pts.category = "Voronoi Options"
+
+        return [p_in, p_out, p_method, p_densify, p_prune, p_smooth, p_res, p_full, p_max_pts]
 
     # ------------------------------------------------------------------
     # Licensing
@@ -274,6 +284,7 @@ class PolygonToCenterlineFast(object):
         parameters[4].enabled = method == "voronoi"
         parameters[5].enabled = method == "skeleton"
         parameters[6].enabled = method == "skeleton"
+        parameters[8].enabled = method == "voronoi"
 
     def updateMessages(self, parameters):
         if _MISSING_DEPS:
@@ -290,6 +301,10 @@ class PolygonToCenterlineFast(object):
         res_param = parameters[6]
         if res_param.value is not None and float(res_param.value) <= 0:
             res_param.setErrorMessage("Raster Resolution must be > 0.")
+
+        max_pts_param = parameters[8]
+        if max_pts_param.value is not None and int(max_pts_param.value) < 1:
+            max_pts_param.setErrorMessage("Max Densify Points must be >= 1.")
 
     # ------------------------------------------------------------------
     # Execution
@@ -319,6 +334,9 @@ class PolygonToCenterlineFast(object):
             float(parameters[6].value) if parameters[6].value is not None else None
         )
         single_line = not bool(parameters[7].value)
+        max_densify_points = (
+            int(parameters[8].value) if parameters[8].value is not None else 100000
+        )
 
         # ---- Import fast algorithm -----------------------------------------
         try:
@@ -426,6 +444,7 @@ class PolygonToCenterlineFast(object):
                     raster_resolution=raster_resolution,
                     single_line=single_line,
                     progress_callback=progress_cb,
+                    max_densify_points=max_densify_points,
                 )
             except Exception as exc:
                 messages.addWarningMessage(
