@@ -699,8 +699,184 @@ def _extract_longest_path(G: nx.Graph) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _vertex_interior_angle(ring: np.ndarray, idx: int) -> float:
+    """Return the interior angle (in degrees) at vertex *idx* of *ring*.
+
+    *ring* is a closed polygon ring (first == last).  The angle is computed
+    from the two edges meeting at ``ring[idx]``, using the cross-product
+    sign to distinguish convex (< 180°) from reflex (> 180°) vertices.
+    Returns a value in [0, 360).
+    """
+    n = len(ring) - 1  # number of unique vertices (last == first)
+    if n < 3:
+        return 180.0
+    prev_idx = (idx - 1) % n
+    next_idx = (idx + 1) % n
+    v = ring[idx]
+    a = ring[prev_idx] - v
+    b = ring[next_idx] - v
+    dot = float(a[0] * b[0] + a[1] * b[1])
+    cross = float(a[0] * b[1] - a[1] * b[0])
+    angle_rad = math.atan2(abs(cross), dot)
+    angle_deg = math.degrees(angle_rad)
+    # For a CCW ring, cross > 0 → convex vertex (interior angle < 180°).
+    # For a CW ring, cross < 0 → convex vertex.
+    # We use a simple heuristic: if the absolute angle from atan2 is already
+    # in [0, 180], it represents the included angle between the two edges,
+    # which is what we need to detect obtuse corners.
+    return angle_deg
+
+
+def _ray_ring_intersection(origin: np.ndarray, direction: np.ndarray,
+                           ring: np.ndarray) -> Optional[np.ndarray]:
+    """Find the nearest intersection of a ray with a polygon ring.
+
+    Parameters
+    ----------
+    origin : (2,) array — ray start point.
+    direction : (2,) array — unit direction vector.
+    ring : (V, 2) array — closed polygon ring.
+
+    Returns
+    -------
+    (2,) array — nearest intersection point, or None.
+    """
+    # Vectorised ray–segment intersection for all ring edges at once.
+    p = ring[:-1]             # (K, 2) — segment start points
+    q = ring[1:]              # (K, 2) — segment end points
+    d = q - p                 # (K, 2) — segment directions
+
+    ox, oy = float(origin[0]), float(origin[1])
+    dx, dy = float(direction[0]), float(direction[1])
+
+    # Solve: origin + t * direction = p + s * d
+    #   t = cross(p - origin, d) / cross(direction, d)
+    #   s = cross(p - origin, direction) / cross(direction, d)
+    denom = dx * d[:, 1] - dy * d[:, 0]  # cross(direction, d)  (K,)
+
+    # Avoid division by zero (parallel segments)
+    parallel = np.abs(denom) < 1e-12
+    safe_denom = np.where(parallel, 1.0, denom)
+
+    po = p - origin  # (K, 2)
+    t_num = po[:, 0] * d[:, 1] - po[:, 1] * d[:, 0]    # cross(po, d)
+    s_num = po[:, 0] * dy - po[:, 1] * dx               # cross(po, direction)
+
+    t = t_num / safe_denom
+    s = s_num / safe_denom
+
+    # Valid: t > small epsilon (forward along ray) and 0 <= s <= 1 (on segment)
+    valid = (~parallel) & (t > 1e-9) & (s >= 0.0) & (s <= 1.0)
+
+    if not valid.any():
+        return None
+
+    t_valid = np.where(valid, t, np.inf)
+    best = int(np.argmin(t_valid))
+    return origin + t_valid[best] * direction
+
+
+def _extend_leaves_to_boundary(edges: list,
+                               exterior: np.ndarray,
+                               holes: list,
+                               k: int = 3) -> list:
+    """Extend every leaf node of the skeleton to the nearest polygon boundary.
+
+    Uses *k* nodes along the skeleton from each leaf to fit a direction via
+    least-squares, then ray-casts to the polygon boundary.
+
+    Parameters
+    ----------
+    edges : list of ((x1,y1), (x2,y2)) tuples
+    exterior : (N, 2) closed exterior ring.
+    holes : list of (M, 2) closed hole rings.
+    k : int — number of nodes to walk from each leaf for direction fitting.
+
+    Returns
+    -------
+    Extended edge list (original edges + new extension edges).
+    """
+    if not edges:
+        return edges
+
+    # Build a temporary graph from the edge list
+    G = nx.Graph()
+    for u, v in edges:
+        w = math.hypot(v[0] - u[0], v[1] - u[1])
+        G.add_edge(u, v, weight=w)
+
+    leaves = [n for n in G.nodes() if G.degree(n) == 1]
+    if not leaves:
+        return edges
+
+    new_edges = list(edges)
+    rings = [exterior] + holes
+
+    for leaf in leaves:
+        # Walk up to k nodes from leaf along the skeleton
+        path = [leaf]
+        current = leaf
+        for _ in range(k):
+            neighbors = [nb for nb in G.neighbors(current) if nb not in path]
+            if not neighbors:
+                break
+            # Pick the neighbor (degree-2 chains have exactly one option)
+            nxt = neighbors[0]
+            path.append(nxt)
+            current = nxt
+
+        if len(path) < 2:
+            continue
+
+        # Fit direction from the collected path points
+        pts = np.array(path, dtype=float)  # (m, 2)
+        if len(pts) >= 3:
+            # Least-squares line fit: direction = eigenvector of covariance
+            # with largest eigenvalue
+            centroid = pts.mean(axis=0)
+            centered = pts - centroid
+            cov = centered.T @ centered
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            # Principal direction = eigenvector with larger eigenvalue
+            direction = eigvecs[:, 1].copy()  # (2,)
+        else:
+            # Only 2 points: direction = leaf → neighbor (outward)
+            direction = pts[0] - pts[1]
+
+        norm = np.hypot(direction[0], direction[1])
+        if norm < 1e-12:
+            continue
+        direction /= norm
+
+        # Ensure direction points outward (away from the skeleton interior)
+        # The outward direction is from pts[1] toward pts[0] (leaf)
+        outward = pts[0] - pts[1]
+        if np.dot(direction, outward) < 0:
+            direction = -direction
+
+        # Ray-cast from the leaf to the polygon boundary
+        leaf_pt = np.array(leaf, dtype=float)
+        best_hit = None
+        best_dist = np.inf
+
+        for ring in rings:
+            hit = _ray_ring_intersection(leaf_pt, direction, ring)
+            if hit is not None:
+                d = np.hypot(hit[0] - leaf_pt[0], hit[1] - leaf_pt[1])
+                if d < best_dist:
+                    best_dist = d
+                    best_hit = hit
+
+        if best_hit is not None and best_dist > 1e-9:
+            new_edges.append((leaf, (float(best_hit[0]), float(best_hit[1]))))
+
+    return new_edges
+
+
 def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
-                                densify_distance: float = 1.0) -> list:
+                                densify_distance: float = 1.0,
+                                exterior: Optional[np.ndarray] = None,
+                                obtuse_angle_threshold: float = 150.0) -> list:
     """Decompose the skeleton graph by topology and filter noise segments.
 
     Algorithm
@@ -728,6 +904,15 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
     densify_distance : float
         Densification distance used for Voronoi construction.  Used to
         compute the pre-prune threshold (3 × densify_distance).
+    exterior : np.ndarray or None
+        Closed exterior ring (N, 2) of the polygon.  When provided,
+        terminal branches whose leaf node is near an obtuse polygon vertex
+        (interior angle > *obtuse_angle_threshold*) are removed as
+        non-structural artefacts.
+    obtuse_angle_threshold : float
+        Interior angle (degrees) above which a polygon vertex is considered
+        obtuse.  Terminal branches pointing toward such vertices are removed.
+        Default 150.0.
 
     Returns
     -------
@@ -821,6 +1006,52 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
         # Filtering removed everything — fall back to the longest segment
         longest = max(segments, key=lambda s: s["length"])
         kept = [longest]
+
+    # -- Step 4b: obtuse-angle contour filter --------------------------------
+    # Remove terminal branches whose leaf node is near an obtuse polygon
+    # vertex.  These are Voronoi artefacts caused by gentle bends in the
+    # polygon outline, not genuine structural branches.
+    if exterior is not None and len(exterior) > 3:
+        ring = np.asarray(exterior, dtype=float)
+        n_verts = len(ring) - 1  # unique vertices (ring is closed)
+        if n_verts >= 3:
+            # Pre-compute interior angles for all polygon vertices
+            angles = np.empty(n_verts, dtype=float)
+            for vi in range(n_verts):
+                angles[vi] = _vertex_interior_angle(ring, vi)
+            unique_verts = ring[:n_verts]  # (n_verts, 2)
+
+            kept2 = []
+            for seg in kept:
+                is_internal = (seg["start"] in junctions
+                               and seg["end"] in junctions)
+                if is_internal:
+                    kept2.append(seg)
+                    continue
+
+                # Identify the leaf end of this terminal segment
+                if seg["start"] in leaves:
+                    leaf_pt = np.array(seg["start"], dtype=float)
+                elif seg["end"] in leaves:
+                    leaf_pt = np.array(seg["end"], dtype=float)
+                else:
+                    kept2.append(seg)
+                    continue
+
+                # Find nearest polygon vertex to this leaf
+                dists = np.hypot(unique_verts[:, 0] - leaf_pt[0],
+                                 unique_verts[:, 1] - leaf_pt[1])
+                nearest_idx = int(np.argmin(dists))
+                vertex_angle = angles[nearest_idx]
+
+                if vertex_angle > obtuse_angle_threshold:
+                    # This branch points toward an obtuse corner — remove it
+                    continue
+                kept2.append(seg)
+
+            if kept2:
+                kept = kept2
+            # else: keep original 'kept' to avoid empty result
 
     # -- Step 5: rebuild edge list from kept segments ------------------------
     edge_set = set()
@@ -978,9 +1209,12 @@ def _centerline_voronoi_fast(
 
     if single_line:
         # Plan C: degree-aware branching skeleton extraction
-        edges = _extract_branching_skeleton(G, densify_distance=actual_distance)
+        edges = _extract_branching_skeleton(G, densify_distance=actual_distance,
+                                            exterior=exterior)
         if not edges:
             return None
+        # Extend leaf nodes to polygon boundary (Solution 1-B)
+        edges = _extend_leaves_to_boundary(edges, exterior, holes)
         _report("Centerline extraction complete.", 100)
         return edges
 
