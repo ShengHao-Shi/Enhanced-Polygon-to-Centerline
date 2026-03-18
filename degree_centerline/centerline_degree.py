@@ -700,12 +700,12 @@ def _extract_longest_path(G: nx.Graph) -> list:
 
 
 def _vertex_interior_angle(ring: np.ndarray, idx: int) -> float:
-    """Return the interior angle (in degrees) at vertex *idx* of *ring*.
+    """Return the unsigned angle (degrees) between the two edges at vertex *idx*.
 
-    *ring* is a closed polygon ring (first == last).  The angle is computed
-    from the two edges meeting at ``ring[idx]``, using the cross-product
-    sign to distinguish convex (< 180°) from reflex (> 180°) vertices.
-    Returns a value in [0, 360).
+    *ring* is a closed polygon ring (first == last).  The returned value is
+    the included angle between the incoming and outgoing edges, in [0, 180].
+    This is sufficient for detecting obtuse polygon corners (angle > threshold)
+    regardless of ring winding direction.
     """
     n = len(ring) - 1  # number of unique vertices (last == first)
     if n < 3:
@@ -718,13 +718,7 @@ def _vertex_interior_angle(ring: np.ndarray, idx: int) -> float:
     dot = float(a[0] * b[0] + a[1] * b[1])
     cross = float(a[0] * b[1] - a[1] * b[0])
     angle_rad = math.atan2(abs(cross), dot)
-    angle_deg = math.degrees(angle_rad)
-    # For a CCW ring, cross > 0 → convex vertex (interior angle < 180°).
-    # For a CW ring, cross < 0 → convex vertex.
-    # We use a simple heuristic: if the absolute angle from atan2 is already
-    # in [0, 180], it represents the included angle between the two edges,
-    # which is what we need to detect obtuse corners.
-    return angle_deg
+    return math.degrees(angle_rad)
 
 
 def _ray_ring_intersection(origin: np.ndarray, direction: np.ndarray,
@@ -773,6 +767,8 @@ def _ray_ring_intersection(origin: np.ndarray, direction: np.ndarray,
 
     t_valid = np.where(valid, t, np.inf)
     best = int(np.argmin(t_valid))
+    if t_valid[best] == np.inf:
+        return None
     return origin + t_valid[best] * direction
 
 
@@ -837,8 +833,8 @@ def _extend_leaves_to_boundary(edges: list,
             centered = pts - centroid
             cov = centered.T @ centered
             eigvals, eigvecs = np.linalg.eigh(cov)
-            # Principal direction = eigenvector with larger eigenvalue
-            direction = eigvecs[:, 1].copy()  # (2,)
+            # Principal direction = eigenvector with largest eigenvalue
+            direction = eigvecs[:, np.argmax(eigvals)].copy()  # (2,)
         else:
             # Only 2 points: direction = leaf → neighbor (outward)
             direction = pts[0] - pts[1]
