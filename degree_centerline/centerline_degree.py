@@ -188,6 +188,16 @@ _MAX_DENSIFY_POINTS = 10_000
 # approximately _CHUNK_SIZE × _RING_CHUNK_SIZE × 48 bytes ≈ 384 MB (Plan C).
 _RING_CHUNK_SIZE = 4096
 
+# Fraction of total skeleton length used as the minimum reference for
+# ratio-based terminal-branch filtering.  Ensures that the filter considers
+# the overall skeleton scale, not just the single longest segment.
+_SKELETON_LENGTH_REFERENCE_FRACTION = 0.5
+
+# Terminal branches whose length is at least this fraction of the total
+# skeleton length are protected from the obtuse-angle contour filter,
+# because they likely represent meaningful structural features.
+_LONG_BRANCH_PROTECT_RATIO = 0.2
+
 
 # ---------------------------------------------------------------------------
 # WKT parsing helpers (shared with centerline_pure.py — no changes needed)
@@ -1009,7 +1019,8 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
     max_len = max(seg["length"] for seg in segments)
     # reference_length: blend of max-segment and total-skeleton so that
     # very long branches relative to the skeleton are preserved.
-    reference_length = max(max_len, total_skeleton_length * 0.5)
+    reference_length = max(max_len,
+                          total_skeleton_length * _SKELETON_LENGTH_REFERENCE_FRACTION)
     min_length = reference_length * min_branch_ratio
 
     kept = []
@@ -1030,7 +1041,6 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
     # Length-protection: branches that are long relative to the total
     # skeleton are preserved even if they point toward an obtuse corner,
     # because they likely represent meaningful structural features.
-    _LONG_BRANCH_PROTECT_RATIO = 0.2  # ≥ 20% of skeleton → always keep
     if exterior is not None and len(exterior) > 3:
         ring = np.asarray(exterior, dtype=float)
         n_verts = len(ring) - 1  # unique vertices (ring is closed)
