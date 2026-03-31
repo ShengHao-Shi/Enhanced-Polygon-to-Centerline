@@ -14,8 +14,13 @@ Algorithm (``_extract_branching_skeleton``):
   2. Decompose the graph into **segments** — chains of degree-2 nodes
      connecting pairs of key nodes.
   3. Filter short terminal segments using a ratio-based threshold
-     (``min_branch_ratio`` × longest segment length).
+     (``min_branch_ratio`` × reference length, where reference length is
+     the larger of the single longest segment and 50 % of the total
+     skeleton length).  This prevents long branches from being
+     accidentally discarded.
   4. Always keep **internal** segments (junction → junction).
+  4b. Remove terminal branches near obtuse polygon vertices, but protect
+      branches whose length ≥ 20 % of the total skeleton length.
   5. Return all surviving edges as ``MULTILINESTRING``.
 
 Advantages over the Steiner-tree approach (Plan A):
@@ -884,8 +889,14 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
     3. Walk degree-2 chains between key nodes to build a list of *segments*
        (each segment is a node-path with a cumulative weight).
     4. Drop short **terminal** segments (leaf→junction) whose length is less
-       than ``min_branch_ratio × max_segment_length``.  Internal segments
+       than ``min_branch_ratio × reference_length``, where reference_length
+       is ``max(max_segment_length, total_skeleton_length * 0.5)``.  This
+       uses total skeleton length as context so that long branches relative
+       to the overall skeleton are preserved.  Internal segments
        (junction→junction) are always kept.
+    4b. Remove terminal branches near obtuse polygon vertices, but **protect**
+        branches whose length ≥ 20 % of the total skeleton length to avoid
+        discarding genuinely long structural branches.
     5. If filtering disconnects the graph, keep only the largest connected
        component of the retained edges.
     6. Return all surviving edges as ``[(u, v), …]``.
@@ -895,7 +906,7 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
     G : nx.Graph
         Weighted skeleton graph (nodes are (x, y) coordinate tuples).
     min_branch_ratio : float
-        Fraction of the longest segment below which terminal branches are
+        Fraction of the reference length below which terminal branches are
         considered noise and removed.  Default 0.1 (10 %).
     densify_distance : float
         Densification distance used for Voronoi construction.  Used to
@@ -904,7 +915,8 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
         Closed exterior ring (N, 2) of the polygon.  When provided,
         terminal branches whose leaf node is near an obtuse polygon vertex
         (interior angle > *obtuse_angle_threshold*) are removed as
-        non-structural artefacts.
+        non-structural artefacts — unless the branch is long enough to be
+        protected (≥ 20 % of total skeleton length).
     obtuse_angle_threshold : float
         Interior angle (degrees) above which a polygon vertex is considered
         obtuse.  Terminal branches pointing toward such vertices are removed.
@@ -989,8 +1001,16 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
         return [(u, v) for u, v in G.edges()]
 
     # -- Step 4: filter short terminal segments ------------------------------
+    # Use the total skeleton length as the reference for ratio-based
+    # filtering instead of just the single longest segment.  This prevents
+    # long branches from being discarded simply because one segment happens
+    # to be disproportionately long.
+    total_skeleton_length = sum(seg["length"] for seg in segments)
     max_len = max(seg["length"] for seg in segments)
-    min_length = max_len * min_branch_ratio
+    # reference_length: blend of max-segment and total-skeleton so that
+    # very long branches relative to the skeleton are preserved.
+    reference_length = max(max_len, total_skeleton_length * 0.5)
+    min_length = reference_length * min_branch_ratio
 
     kept = []
     for seg in segments:
@@ -1007,6 +1027,10 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
     # Remove terminal branches whose leaf node is near an obtuse polygon
     # vertex.  These are Voronoi artefacts caused by gentle bends in the
     # polygon outline, not genuine structural branches.
+    # Length-protection: branches that are long relative to the total
+    # skeleton are preserved even if they point toward an obtuse corner,
+    # because they likely represent meaningful structural features.
+    _LONG_BRANCH_PROTECT_RATIO = 0.2  # ≥ 20% of skeleton → always keep
     if exterior is not None and len(exterior) > 3:
         ring = np.asarray(exterior, dtype=float)
         n_verts = len(ring) - 1  # unique vertices (ring is closed)
@@ -1022,6 +1046,13 @@ def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
                 is_internal = (seg["start"] in junctions
                                and seg["end"] in junctions)
                 if is_internal:
+                    kept2.append(seg)
+                    continue
+
+                # Length protection: long branches are always kept
+                if (total_skeleton_length > 0
+                        and seg["length"] / total_skeleton_length
+                        >= _LONG_BRANCH_PROTECT_RATIO):
                     kept2.append(seg)
                     continue
 
