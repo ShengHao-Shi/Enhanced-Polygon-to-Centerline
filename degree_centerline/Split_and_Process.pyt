@@ -520,6 +520,7 @@ class PolygonToCenterlineTiled(object):
                     max_bbox_area=max_bbox_area,
                     buffer_factor=buffer_factor,
                     max_depth=max_depth,
+                    max_densify_points=max_densify_points,
                     progress_callback=progress_cb,
                 )
             except Exception as exc:

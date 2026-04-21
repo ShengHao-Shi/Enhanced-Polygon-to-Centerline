@@ -522,6 +522,7 @@ def tile_and_extract_centerline(
     max_bbox_area: Optional[float] = None,
     buffer_factor: float = _DEFAULT_BUFFER_FACTOR,
     max_depth: int = _DEFAULT_MAX_DEPTH,
+    max_densify_points: int = 10_000,
     progress_callback=None,
 ) -> Optional[str]:
     """Three-phase tiled centerline extraction for large or complex polygons.
@@ -543,6 +544,19 @@ def tile_and_extract_centerline(
     (the *overlap buffer*).  The centerline is extracted from this larger
     buffered tile and then clipped back to the original quadrant boundary so
     that adjacent tiles produce seamless results when merged.
+
+    .. note::
+        The underlying algorithm may automatically increase *densify_distance*
+        for a tile if the tile's perimeter divided by *densify_distance* would
+        exceed *max_densify_points*.  In that case the actual densification
+        distance used inside the tile is larger than the value passed in, while
+        the overlap buffer is always computed as
+        ``buffer_factor × densify_distance`` (the user-supplied value).  To
+        keep the buffer correctly sized relative to the actual skeleton
+        resolution, either set *max_densify_points* high enough that adaptive
+        densification does not trigger, or increase *buffer_factor*
+        accordingly.  The default Phase B *max_vertices* threshold (8 000) is
+        conservative enough that adaptive densification rarely activates.
 
     Parameters
     ----------
@@ -576,6 +590,12 @@ def tile_and_extract_centerline(
     max_depth:
         Maximum quad-tree recursion depth.  At depth *d* a single polygon can
         produce at most 4 ** *d* tiles.  Default 5 (≤ 1 024 tiles).
+    max_densify_points:
+        Per-tile cap on the number of densified boundary points.  When a
+        tile's perimeter / *densify_distance* would exceed this value the
+        underlying algorithm automatically increases the densification
+        distance.  Passed through unchanged to
+        ``polygon_to_centerline_wkt``.  Default 10,000.
     progress_callback:
         Optional ``callable(message: str, percentage: int)`` for progress
         reporting.  *percentage* is 0–100 or -1 if indeterminate.
@@ -679,6 +699,7 @@ def tile_and_extract_centerline(
                     smooth_sigma=smooth_sigma,
                     raster_resolution=raster_resolution,
                     single_line=single_line,
+                    max_densify_points=max_densify_points,
                 )
             except Exception:
                 result_wkt = None
