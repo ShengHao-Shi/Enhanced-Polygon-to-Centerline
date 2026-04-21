@@ -102,12 +102,52 @@ All parameters are identical to `fast_centerline/`, with one difference:
   all noise branches.  When unchecked (default), the degree-aware
   decomposition produces a clean branching centerline.
 
+---
+
+## Tiled extraction for large / complex datasets
+
+For country-scale or otherwise very large polygon datasets (e.g. all Canadian
+waterways) the single-pass algorithm can miss long narrow channels and run out
+of practical memory.  The companion module `split_and_process.py` implements a
+three-phase strategy to work around both limitations:
+
+| Phase | What it does |
+|---|---|
+| **A** Connected-component split | Each MULTIPOLYGON part is processed independently; unconnected water bodies cannot affect each other's skeleton graph. |
+| **B** Adaptive quad-tree subdivision | Polygon parts exceeding a vertex-count threshold are recursively split into four quadrant tiles until each tile is simple enough to process reliably. |
+| **C** Overlap-buffer extraction | Each tile is expanded outward by `buffer_factor × densify_distance` before clipping; this prevents the Voronoi algorithm from producing spurious branches at tile seams.  The extracted centerline is clipped back to the original tile boundary before merging. |
+
+### Python API
+
+```python
+from split_and_process import tile_and_extract_centerline
+
+result_wkt = tile_and_extract_centerline(
+    wkt,                  # WKT POLYGON or MULTIPOLYGON
+    densify_distance=1.0,
+    max_vertices=8000,    # Phase B: vertex threshold per tile
+    max_bbox_area=None,   # Phase B: optional bbox area threshold
+    buffer_factor=5.0,    # Phase C: buffer = factor × densify_distance
+    max_depth=5,          # Phase B: max quad-tree depth
+)
+```
+
+### ArcGIS toolbox
+
+Load `Split_and_Process.pyt` in ArcGIS Pro (same steps as above) and run
+**Polygon to Centerline (Tiled)**.  All tiling parameters are exposed as
+tool parameters with descriptive help text.
+
+---
+
 ## File listing
 
 | File | Description |
 |---|---|
-| `Degree_Centerline.pyt` | ArcGIS Python Toolbox |
+| `Degree_Centerline.pyt` | ArcGIS Python Toolbox — single-pass extraction |
 | `centerline_degree.py` | Degree-aware branching centerline algorithm |
+| `Split_and_Process.pyt` | ArcGIS Python Toolbox — tiled extraction for large datasets |
+| `split_and_process.py` | Three-phase tiling wrapper around `centerline_degree.py` |
 | `install_dependencies.bat` | Windows helper — one conda command |
 | `requirements.txt` | Dependency list |
 | `README.md` | This file |
