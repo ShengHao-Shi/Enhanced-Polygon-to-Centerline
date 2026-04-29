@@ -545,8 +545,6 @@ class TestProcessGeoDataFrames:
     def test_crs_mismatch_auto_reprojects(self):
         """CRS mismatch between poly and centerline should be handled gracefully."""
         from shapely.geometry import Polygon, LineString
-        import pyproj
-
         poly_gdf = gpd.GeoDataFrame(
             geometry=[Polygon([(-50, -5), (50, -5), (50, 5), (-50, 5)])],
             crs="EPSG:32650",
