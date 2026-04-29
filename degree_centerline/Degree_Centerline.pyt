@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Fast_Centerline.pyt
-===================
-ArcGIS Python Toolbox that wraps the accelerated, shapely-free centerline
-algorithm implemented in ``centerline_fast.py``.
+Degree_Centerline.pyt
+======================
+Degree-Aware Branching Centerline Toolbox — ArcGIS Python Toolbox that wraps
+the degree-aware branching centerline algorithm in ``centerline_degree.py``.
 
-Why use this toolbox instead of ``pure_centerline/Pure_Centerline.pyt``?
-------------------------------------------------------------------------
-Both toolboxes share the same shapely-free design (no shapely, geopandas,
-or pandas), so neither triggers the "Tool not licensed" dependency conflict
-that plagued ``gdal_centerline/GDAL_Centerline.pyt``.
+Unlike ``fast_centerline/Fast_Centerline.pyt`` which extracts only the single
+longest path, this toolbox preserves ALL meaningful branches by decomposing the
+Voronoi skeleton graph into topological segments and filtering noise branches.
 
-This toolbox is significantly faster on large or densely-sampled polygons
-because every geometry computation is performed with vectorised NumPy array
-operations rather than Python loops.  See ``centerline_fast.py`` for a
-detailed breakdown of all four acceleration techniques.
+The output is a branching ``MULTILINESTRING`` that faithfully represents the
+full skeleton topology of the input polygon.
 
 Runtime dependencies
 --------------------
-Same as ``pure_centerline``:
+Same as ``fast_centerline``:
     numpy    – pre-installed in every ArcGIS Pro Python environment.
     scipy    – usually pre-installed in ArcGIS Pro.
     networkx – install from conda-forge (see install_dependencies.bat):
@@ -27,16 +23,13 @@ Same as ``pure_centerline``:
 Optional (recommended for fastest rasterisation):
     matplotlib – usually pre-installed in ArcGIS Pro.
 
-For ``method=skeleton`` also install scikit-image:
-                   conda install -c conda-forge scikit-image
-
 How to load this toolbox
 ------------------------
 In **ArcGIS Pro** (Catalog pane) or **ArcCatalog**:
-  1. Right-click a folder → Add Toolbox → select ``Fast_Centerline.pyt``.
-  2. Expand the toolbox and run **Polygon to Centerline (Fast)**.
+  1. Right-click a folder → Add Toolbox → select ``Degree_Centerline.pyt``.
+  2. Expand the toolbox and run **Polygon to Centerline (Degree-Aware)**.
 
-``centerline_fast.py`` must be in the **same directory** as this ``.pyt``
+``centerline_degree.py`` must be in the **same directory** as this ``.pyt``
 file so that it can be imported at run-time.
 """
 
@@ -102,20 +95,20 @@ _INSTALL_HELP = (
     "Missing: {missing}\n"
     "\n"
     "Quick fix — run 'install_dependencies.bat' found in the same\n"
-    "folder as this toolbox (fast_centerline/).  See README.md for\n"
+    "folder as this toolbox (degree_centerline/).  See README.md for\n"
     "full instructions.\n"
     "\n"
     "Manual installation (ArcGIS Pro Python Command Prompt):\n"
     "\n"
     "  Step 1 — Clone the default environment (only once):\n"
-    "    conda create --name arcgispro-py3-fast --clone arcgispro-py3\n"
+    "    conda create --name arcgispro-py3-degree --clone arcgispro-py3\n"
     "\n"
     "  Step 2 — Install networkx into the clone:\n"
-    "    activate arcgispro-py3-fast\n"
+    "    activate arcgispro-py3-degree\n"
     "    conda install -c conda-forge -y networkx\n"
     "\n"
     "  Step 3 — Set the clone as the active environment in ArcGIS Pro:\n"
-    "    Project > Python > Python Environments > arcgispro-py3-fast\n"
+    "    Project > Python > Python Environments > arcgispro-py3-degree\n"
     "    Restart ArcGIS Pro.\n"
     "\n"
     "  Note: numpy and scipy are usually already present in the default\n"
@@ -131,9 +124,9 @@ _INSTALL_HELP = (
 class Toolbox(object):
     def __init__(self):
         """Define the toolbox (the name of the toolbox is the name of the .pyt file)."""
-        self.label = "Fast Centerline"
-        self.alias = "FastCenterline"
-        self.tools = [PolygonToCenterlineFast]
+        self.label = "Degree Centerline"
+        self.alias = "DegreeCenterline"
+        self.tools = [PolygonToCenterlineDegree]
 
 
 # ---------------------------------------------------------------------------
@@ -141,35 +134,28 @@ class Toolbox(object):
 # ---------------------------------------------------------------------------
 
 
-class PolygonToCenterlineFast(object):
-    """ArcGIS tool that wraps the accelerated polygon_to_centerline_wkt()."""
+class PolygonToCenterlineDegree(object):
+    """ArcGIS tool that wraps the degree-aware polygon_to_centerline_wkt()."""
 
     def __init__(self):
-        self.label = "Polygon to Centerline (Fast)"
+        self.label = "Polygon to Centerline (Degree-Aware)"
         self.description = (
-            "Converts polygon features to centerline polylines using an "
-            "accelerated, shapely-free open-source implementation.\n\n"
-            "This tool is significantly faster than 'Polygon to Centerline (Pure)' "
-            "on large or densely-sampled polygons because all geometry operations "
-            "are performed with vectorised NumPy array operations instead of "
-            "Python loops.\n\n"
-            "Four acceleration techniques are used:\n"
-            "  1. Vectorised densification (numpy arange/broadcasting replaces the\n"
-            "     innermost interpolation loop).\n"
-            "  2. Batch Voronoi ridge filtering — all M ridges are tested against\n"
-            "     all K ring edges in a single (M x K) numpy broadcast; no Python\n"
-            "     loop over ridges.\n"
-            "  3. Vectorised rasterisation — all pixels tested at once using\n"
-            "     matplotlib.path.Path (C extension) or numpy 2-D broadcast.\n"
-            "  4. Vectorised skeleton graph construction — edge discovery via numpy\n"
-            "     shift-and-intersect; all edges added in one batch call.\n\n"
-            "Like the Pure toolbox, this tool requires only numpy (pre-installed),\n"
-            "scipy (usually pre-installed), and networkx (conda-forge).  No shapely,\n"
-            "geopandas, or pandas are required, so it works with any ArcGIS licence\n"
-            "level (Basic / Standard / Advanced) without dependency conflicts.\n\n"
-            "Two algorithms:\n"
-            "  voronoi  — Vector-based Voronoi / Thiessen skeleton (default).\n"
-            "  skeleton — Raster-based morphological thinning (requires scikit-image)."
+            "Converts polygon features to branching centerline polylines using "
+            "degree-aware Voronoi skeleton decomposition that preserves ALL "
+            "meaningful branches of the medial-axis graph.\n\n"
+            "Unlike a single-path tool which extracts only the longest path "
+            "(losing all branches), this tool decomposes the Voronoi skeleton "
+            "into topological segments between junctions and leaf nodes, filters "
+            "out short noise branches, and returns a MULTILINESTRING that "
+            "faithfully represents the branching centerline.\n\n"
+            "Faster than the Steiner-tree approach because it uses O(V+E) graph "
+            "traversal instead of NP-hard Steiner-tree approximation.\n\n"
+            "Acceleration techniques:\n"
+            "  1. Vectorised boundary densification.\n"
+            "  2. Batch Voronoi ridge filtering (midpoint PIP + crossing test).\n"
+            "  3. Degree-aware skeleton decomposition and noise filtering.\n\n"
+            "Requires only numpy (pre-installed), scipy (usually pre-installed),\n"
+            "and networkx (conda-forge).  No shapely, geopandas, or pandas required."
         )
         self.canRunInBackground = True
 
@@ -188,6 +174,11 @@ class PolygonToCenterlineFast(object):
             direction="Input",
         )
         p_in.filter.list = ["Polygon"]
+        p_in.description = (
+            "The input polygon feature layer or feature class whose shapes "
+            "will be converted to centerline polylines.  Each polygon is "
+            "processed independently."
+        )
 
         p_out = arcpy.Parameter(
             displayName="Output Centerline Features",
@@ -196,17 +187,12 @@ class PolygonToCenterlineFast(object):
             parameterType="Required",
             direction="Output",
         )
-
-        p_method = arcpy.Parameter(
-            displayName="Method",
-            name="method",
-            datatype="GPString",
-            parameterType="Optional",
-            direction="Input",
+        p_out.description = (
+            "Path to the output polyline feature class.  Each output feature "
+            "is a MULTILINESTRING representing the branching centerline of "
+            "the corresponding input polygon.  Attribute fields from the "
+            "input are copied over, plus an ORIG_FID field."
         )
-        p_method.filter.type = "ValueList"
-        p_method.filter.list = ["voronoi", "skeleton"]
-        p_method.value = "voronoi"
 
         p_densify = arcpy.Parameter(
             displayName="Densification Distance (CRS units)",
@@ -216,6 +202,15 @@ class PolygonToCenterlineFast(object):
             direction="Input",
         )
         p_densify.value = 1.0
+        p_densify.description = (
+            "Maximum spacing between boundary vertices before Voronoi "
+            "tessellation.  Smaller values produce a more detailed "
+            "centerline but increase computation time and memory usage.\n\n"
+            "Recommended range: 0.5 – 5.0 (in CRS map units).\n"
+            "  - Use 0.5 – 1.0 for small or detailed polygons.\n"
+            "  - Use 2.0 – 5.0 for large or simple polygons.\n\n"
+            "Must be > 0.  Default: 1.0."
+        )
 
         p_prune = arcpy.Parameter(
             displayName="Branch Prune Threshold (CRS units; 0 = no pruning)",
@@ -225,35 +220,38 @@ class PolygonToCenterlineFast(object):
             direction="Input",
         )
         p_prune.value = 0.0
-        p_prune.category = "Voronoi Options"
-
-        p_smooth = arcpy.Parameter(
-            displayName="Gaussian Smooth Sigma (CRS units; 0 = no smoothing)",
-            name="smooth_sigma",
-            datatype="GPDouble",
-            parameterType="Optional",
-            direction="Input",
+        p_prune.description = (
+            "Minimum branch length to keep after initial skeleton "
+            "construction.  Branches shorter than this value are pruned "
+            "as noise.  Set to 0 to skip this pruning step and rely "
+            "solely on the degree-aware ratio-based filtering.\n\n"
+            "Recommended range: 0 – 10.0 (in CRS map units).\n"
+            "  - 0 (default): no explicit pruning; the algorithm's "
+            "built-in ratio filter handles noise.\n"
+            "  - 1.0 – 5.0: light cleanup for noisy boundaries.\n"
+            "  - 5.0 – 10.0: aggressive pruning; keeps only major branches.\n\n"
+            "Must be >= 0.  Default: 0.0."
         )
-        p_smooth.value = 0.0
-        p_smooth.category = "Skeleton Options"
-
-        p_res = arcpy.Parameter(
-            displayName="Raster Resolution Override (CRS units; blank = auto)",
-            name="raster_resolution",
-            datatype="GPDouble",
-            parameterType="Optional",
-            direction="Input",
-        )
-        p_res.category = "Skeleton Options"
 
         p_full = arcpy.Parameter(
-            displayName="Return Full Skeleton (may contain branches / forks)",
+            displayName="Return Full Raw Skeleton (skip degree-aware filtering)",
             name="full_skeleton",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input",
         )
         p_full.value = False
+        p_full.description = (
+            "When checked (True), returns ALL Voronoi skeleton edges "
+            "inside the polygon without degree-aware branch filtering.  "
+            "This produces the raw medial-axis graph, which may contain "
+            "many short noise branches.\n\n"
+            "When unchecked (False, default), the degree-aware algorithm "
+            "decomposes the skeleton into topological segments and filters "
+            "out short terminal branches, producing a clean branching "
+            "centerline.\n\n"
+            "Default: False (unchecked)."
+        )
 
         p_max_pts = arcpy.Parameter(
             displayName="Max Densify Points",
@@ -263,9 +261,20 @@ class PolygonToCenterlineFast(object):
             direction="Input",
         )
         p_max_pts.value = 10000
-        p_max_pts.category = "Voronoi Options"
+        p_max_pts.description = (
+            "Upper limit on the number of densified boundary points.  "
+            "If the polygon perimeter divided by Densification Distance "
+            "would exceed this cap, the distance is automatically "
+            "increased to stay within the limit.\n\n"
+            "Prevents excessive memory usage on very large polygons.\n\n"
+            "Recommended range: 5,000 – 100,000.\n"
+            "  - 10,000 (default): good balance of detail and speed.\n"
+            "  - 5,000: faster, less detail.\n"
+            "  - 50,000 – 100,000: more detail; requires more RAM.\n\n"
+            "Must be >= 1.  Default: 10,000."
+        )
 
-        return [p_in, p_out, p_method, p_densify, p_prune, p_smooth, p_res, p_full, p_max_pts]
+        return [p_in, p_out, p_densify, p_prune, p_full, p_max_pts]
 
     # ------------------------------------------------------------------
     # Licensing
@@ -280,11 +289,7 @@ class PolygonToCenterlineFast(object):
     # ------------------------------------------------------------------
 
     def updateParameters(self, parameters):
-        method = parameters[2].valueAsText or "voronoi"
-        parameters[4].enabled = method == "voronoi"
-        parameters[5].enabled = method == "skeleton"
-        parameters[6].enabled = method == "skeleton"
-        parameters[8].enabled = method == "voronoi"
+        return
 
     def updateMessages(self, parameters):
         if _MISSING_DEPS:
@@ -293,16 +298,22 @@ class PolygonToCenterlineFast(object):
             )
             return
 
-        for idx in (3, 4, 5):
-            param = parameters[idx]
-            if param.value is not None and float(param.value) < 0:
-                param.setErrorMessage("Value must be >= 0.")
+        # p_densify (index 2)
+        densify_param = parameters[2]
+        if densify_param.value is not None and float(densify_param.value) <= 0:
+            densify_param.setErrorMessage(
+                "Densification Distance must be > 0."
+            )
 
-        res_param = parameters[6]
-        if res_param.value is not None and float(res_param.value) <= 0:
-            res_param.setErrorMessage("Raster Resolution must be > 0.")
+        # p_prune (index 3)
+        prune_param = parameters[3]
+        if prune_param.value is not None and float(prune_param.value) < 0:
+            prune_param.setErrorMessage(
+                "Branch Prune Threshold must be >= 0."
+            )
 
-        max_pts_param = parameters[8]
+        # p_max_pts (index 5)
+        max_pts_param = parameters[5]
         if max_pts_param.value is not None and int(max_pts_param.value) < 1:
             max_pts_param.setErrorMessage("Max Densify Points must be >= 1.")
 
@@ -311,7 +322,7 @@ class PolygonToCenterlineFast(object):
     # ------------------------------------------------------------------
 
     def execute(self, parameters, messages):
-        """Run the fast centerline algorithm."""
+        """Run the degree-aware centerline algorithm."""
 
         tbx_dir = os.path.dirname(os.path.abspath(__file__))
         if tbx_dir not in sys.path:
@@ -320,31 +331,25 @@ class PolygonToCenterlineFast(object):
         # ---- Unpack parameters -------------------------------------------
         in_features = parameters[0].valueAsText
         out_features = parameters[1].valueAsText
-        method = parameters[2].valueAsText or "voronoi"
+        method = "voronoi"
         densify_distance = (
-            float(parameters[3].value) if parameters[3].value is not None else 1.0
+            float(parameters[2].value) if parameters[2].value is not None else 1.0
         )
         prune_threshold = (
-            float(parameters[4].value) if parameters[4].value is not None else 0.0
+            float(parameters[3].value) if parameters[3].value is not None else 0.0
         )
-        smooth_sigma = (
-            float(parameters[5].value) if parameters[5].value is not None else 0.0
-        )
-        raster_resolution = (
-            float(parameters[6].value) if parameters[6].value is not None else None
-        )
-        single_line = not bool(parameters[7].value)
+        single_line = not bool(parameters[4].value)
         max_densify_points = (
-            int(parameters[8].value) if parameters[8].value is not None else 10000
+            int(parameters[5].value) if parameters[5].value is not None else 10000
         )
 
         # ---- Import fast algorithm -----------------------------------------
         try:
-            from centerline_fast import polygon_to_centerline_wkt
+            from centerline_degree import polygon_to_centerline_wkt
         except ImportError:
             messages.addErrorMessage(
-                "Could not import 'centerline_fast' module.\n"
-                "Ensure 'centerline_fast.py' is in the same folder as this toolbox:\n"
+                "Could not import 'centerline_degree' module.\n"
+                "Ensure 'centerline_degree.py' is in the same folder as this toolbox:\n"
                 "  {}".format(tbx_dir)
             )
             raise
@@ -440,8 +445,6 @@ class PolygonToCenterlineFast(object):
                     method=method,
                     densify_distance=densify_distance,
                     prune_threshold=prune_threshold,
-                    smooth_sigma=smooth_sigma,
-                    raster_resolution=raster_resolution,
                     single_line=single_line,
                     progress_callback=progress_cb,
                     max_densify_points=max_densify_points,

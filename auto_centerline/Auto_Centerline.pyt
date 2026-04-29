@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Fast_Centerline.pyt
+Auto_Centerline.pyt
 ===================
-ArcGIS Python Toolbox that wraps the accelerated, shapely-free centerline
-algorithm implemented in ``centerline_fast.py``.
+Auto-Threshold Branching Centerline Toolbox — ArcGIS Python Toolbox that
+wraps the auto-threshold pruning algorithm in ``centerline_auto.py``.
 
-Why use this toolbox instead of ``pure_centerline/Pure_Centerline.pyt``?
+Why use this toolbox instead of ``fast_centerline/Fast_Centerline.pyt``?
 ------------------------------------------------------------------------
-Both toolboxes share the same shapely-free design (no shapely, geopandas,
-or pandas), so neither triggers the "Tool not licensed" dependency conflict
-that plagued ``gdal_centerline/GDAL_Centerline.pyt``.
+Both toolboxes share the same shapely-free, vectorised design.  This toolbox
+automatically computes a pruning threshold based on polygon geometry (area
+and skeleton length), removes noise branches, and returns a branching
+centerline (MULTILINESTRING) instead of a single longest path.
 
-This toolbox is significantly faster on large or densely-sampled polygons
-because every geometry computation is performed with vectorised NumPy array
-operations rather than Python loops.  See ``centerline_fast.py`` for a
-detailed breakdown of all four acceleration techniques.
+This is ideal when polygons have meaningful branches (e.g. river deltas,
+road junctions, building footprints with wings) and you want all of them
+preserved in the output.
 
 Runtime dependencies
 --------------------
-Same as ``pure_centerline``:
+Same as ``fast_centerline``:
     numpy    – pre-installed in every ArcGIS Pro Python environment.
     scipy    – usually pre-installed in ArcGIS Pro.
     networkx – install from conda-forge (see install_dependencies.bat):
@@ -33,10 +33,10 @@ For ``method=skeleton`` also install scikit-image:
 How to load this toolbox
 ------------------------
 In **ArcGIS Pro** (Catalog pane) or **ArcCatalog**:
-  1. Right-click a folder → Add Toolbox → select ``Fast_Centerline.pyt``.
-  2. Expand the toolbox and run **Polygon to Centerline (Fast)**.
+  1. Right-click a folder → Add Toolbox → select ``Auto_Centerline.pyt``.
+  2. Expand the toolbox and run **Polygon to Centerline (Auto Branching)**.
 
-``centerline_fast.py`` must be in the **same directory** as this ``.pyt``
+``centerline_auto.py`` must be in the **same directory** as this ``.pyt``
 file so that it can be imported at run-time.
 """
 
@@ -102,20 +102,20 @@ _INSTALL_HELP = (
     "Missing: {missing}\n"
     "\n"
     "Quick fix — run 'install_dependencies.bat' found in the same\n"
-    "folder as this toolbox (fast_centerline/).  See README.md for\n"
+    "folder as this toolbox (auto_centerline/).  See README.md for\n"
     "full instructions.\n"
     "\n"
     "Manual installation (ArcGIS Pro Python Command Prompt):\n"
     "\n"
     "  Step 1 — Clone the default environment (only once):\n"
-    "    conda create --name arcgispro-py3-fast --clone arcgispro-py3\n"
+    "    conda create --name arcgispro-py3-auto --clone arcgispro-py3\n"
     "\n"
     "  Step 2 — Install networkx into the clone:\n"
-    "    activate arcgispro-py3-fast\n"
+    "    activate arcgispro-py3-auto\n"
     "    conda install -c conda-forge -y networkx\n"
     "\n"
     "  Step 3 — Set the clone as the active environment in ArcGIS Pro:\n"
-    "    Project > Python > Python Environments > arcgispro-py3-fast\n"
+    "    Project > Python > Python Environments > arcgispro-py3-auto\n"
     "    Restart ArcGIS Pro.\n"
     "\n"
     "  Note: numpy and scipy are usually already present in the default\n"
@@ -131,9 +131,9 @@ _INSTALL_HELP = (
 class Toolbox(object):
     def __init__(self):
         """Define the toolbox (the name of the toolbox is the name of the .pyt file)."""
-        self.label = "Fast Centerline"
-        self.alias = "FastCenterline"
-        self.tools = [PolygonToCenterlineFast]
+        self.label = "Auto Centerline"
+        self.alias = "AutoCenterline"
+        self.tools = [PolygonToCenterlineAuto]
 
 
 # ---------------------------------------------------------------------------
@@ -141,18 +141,24 @@ class Toolbox(object):
 # ---------------------------------------------------------------------------
 
 
-class PolygonToCenterlineFast(object):
-    """ArcGIS tool that wraps the accelerated polygon_to_centerline_wkt()."""
+class PolygonToCenterlineAuto(object):
+    """ArcGIS tool that wraps the auto-threshold polygon_to_centerline_wkt()."""
 
     def __init__(self):
-        self.label = "Polygon to Centerline (Fast)"
+        self.label = "Polygon to Centerline (Auto Branching)"
         self.description = (
-            "Converts polygon features to centerline polylines using an "
-            "accelerated, shapely-free open-source implementation.\n\n"
-            "This tool is significantly faster than 'Polygon to Centerline (Pure)' "
-            "on large or densely-sampled polygons because all geometry operations "
-            "are performed with vectorised NumPy array operations instead of "
-            "Python loops.\n\n"
+            "Converts polygon features to branching centerline polylines using "
+            "automatic threshold pruning.\n\n"
+            "Unlike the Fast Centerline tool (which returns only the single "
+            "longest path), this tool automatically computes a pruning threshold "
+            "based on the polygon's geometry (area and skeleton length), removes "
+            "short noise branches, and returns all remaining meaningful branches "
+            "as a MULTILINESTRING.\n\n"
+            "The automatic threshold is:\n"
+            "  max(area / skeleton_length × 0.5, densify_distance × 3.0)\n\n"
+            "This preserves structural branches (e.g. river deltas, road "
+            "junctions, building wings) while removing Voronoi artefacts "
+            "near polygon corners.\n\n"
             "Four acceleration techniques are used:\n"
             "  1. Vectorised densification (numpy arange/broadcasting replaces the\n"
             "     innermost interpolation loop).\n"
@@ -163,10 +169,9 @@ class PolygonToCenterlineFast(object):
             "     matplotlib.path.Path (C extension) or numpy 2-D broadcast.\n"
             "  4. Vectorised skeleton graph construction — edge discovery via numpy\n"
             "     shift-and-intersect; all edges added in one batch call.\n\n"
-            "Like the Pure toolbox, this tool requires only numpy (pre-installed),\n"
-            "scipy (usually pre-installed), and networkx (conda-forge).  No shapely,\n"
-            "geopandas, or pandas are required, so it works with any ArcGIS licence\n"
-            "level (Basic / Standard / Advanced) without dependency conflicts.\n\n"
+            "Like the Fast and Pure toolboxes, this tool requires only numpy\n"
+            "(pre-installed), scipy (usually pre-installed), and networkx\n"
+            "(conda-forge).  No shapely, geopandas, or pandas are required.\n\n"
             "Two algorithms:\n"
             "  voronoi  — Vector-based Voronoi / Thiessen skeleton (default).\n"
             "  skeleton — Raster-based morphological thinning (requires scikit-image)."
@@ -218,7 +223,7 @@ class PolygonToCenterlineFast(object):
         p_densify.value = 1.0
 
         p_prune = arcpy.Parameter(
-            displayName="Branch Prune Threshold (CRS units; 0 = no pruning)",
+            displayName="Min Branch Prune Threshold (auto-computed if 0; CRS units)",
             name="prune_threshold",
             datatype="GPDouble",
             parameterType="Optional",
@@ -247,7 +252,7 @@ class PolygonToCenterlineFast(object):
         p_res.category = "Skeleton Options"
 
         p_full = arcpy.Parameter(
-            displayName="Return Full Skeleton (may contain branches / forks)",
+            displayName="Return Full Raw Skeleton (before auto-pruning)",
             name="full_skeleton",
             datatype="GPBoolean",
             parameterType="Optional",
@@ -311,7 +316,7 @@ class PolygonToCenterlineFast(object):
     # ------------------------------------------------------------------
 
     def execute(self, parameters, messages):
-        """Run the fast centerline algorithm."""
+        """Run the auto-threshold centerline algorithm."""
 
         tbx_dir = os.path.dirname(os.path.abspath(__file__))
         if tbx_dir not in sys.path:
@@ -338,13 +343,13 @@ class PolygonToCenterlineFast(object):
             int(parameters[8].value) if parameters[8].value is not None else 10000
         )
 
-        # ---- Import fast algorithm -----------------------------------------
+        # ---- Import auto algorithm -----------------------------------------
         try:
-            from centerline_fast import polygon_to_centerline_wkt
+            from centerline_auto import polygon_to_centerline_wkt
         except ImportError:
             messages.addErrorMessage(
-                "Could not import 'centerline_fast' module.\n"
-                "Ensure 'centerline_fast.py' is in the same folder as this toolbox:\n"
+                "Could not import 'centerline_auto' module.\n"
+                "Ensure 'centerline_auto.py' is in the same folder as this toolbox:\n"
                 "  {}".format(tbx_dir)
             )
             raise

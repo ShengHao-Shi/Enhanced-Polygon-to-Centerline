@@ -1,15 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-centerline_fast.py
+centerline_auto.py
 ==================
-Accelerated, shapely-free polygon-to-centerline algorithm for ArcGIS Pro.
+Auto-Threshold Branching Centerline — accelerated, shapely-free algorithm
+for ArcGIS Pro.
 
 No shapely, geopandas, or pandas required.  Same dependencies as
-``pure_centerline/centerline_pure.py`` (numpy, scipy, networkx) plus the
+``fast_centerline/centerline_fast.py`` (numpy, scipy, networkx) plus the
 optional matplotlib for even faster rasterisation.
 
-Speed Improvements Over ``pure_centerline/centerline_pure.py``
---------------------------------------------------------------
+Key Difference from ``fast_centerline/centerline_fast.py``
+----------------------------------------------------------
+Instead of extracting only the single longest path (``_extract_longest_path``),
+this module **automatically computes a pruning threshold** based on the
+polygon's geometry, prunes short noise branches, and returns the full
+remaining skeleton as a branching centerline (MULTILINESTRING).
+
+The automatic threshold is:
+    max(area / total_skeleton_length × 0.5, densify_distance × 3.0)
+
+This preserves meaningful structural branches while removing Voronoi
+artefacts near polygon corners and other noise.
+
+Speed Improvements (inherited from ``fast_centerline/centerline_fast.py``)
+--------------------------------------------------------------------------
 The baseline ``centerline_pure.py`` replaced every shapely call with pure-
 Python loops, which is correct but slow for large or densely-sampled polygons.
 This module keeps the same algorithm and the identical public API but
@@ -303,6 +317,109 @@ def _compute_perimeter(exterior: np.ndarray, holes: list) -> float:
         diffs = ring[1:] - ring[:-1]
         total += float(np.hypot(diffs[:, 0], diffs[:, 1]).sum())
     return total
+
+
+# ---------------------------------------------------------------------------
+# Auto-threshold pruning helpers
+# ---------------------------------------------------------------------------
+
+
+def _polygon_area(exterior: np.ndarray, holes: list) -> float:
+    """Compute polygon area using the Shoelace formula."""
+    def _ring_area(ring):
+        x, y = ring[:, 0], ring[:, 1]
+        return 0.5 * abs(float(np.sum(x[:-1] * y[1:] - x[1:] * y[:-1])))
+    area = _ring_area(exterior)
+    for hole in holes:
+        area -= _ring_area(hole)
+    return max(area, 0.0)
+
+
+def _auto_prune_threshold(
+    G: nx.Graph,
+    exterior: np.ndarray,
+    holes: list,
+    densify_distance: float,
+) -> float:
+    """
+    Automatically compute a pruning threshold based on polygon geometry.
+
+    Uses multiple heuristics and picks the most robust estimate:
+
+    Strategy 1 (primary): Based on polygon "typical width"
+        typical_width = area / total_skeleton_length
+        threshold = typical_width × 0.5
+
+    Strategy 2 (floor): Based on densification distance
+        threshold = densify_distance × 3.0
+
+    The final threshold is: max(strategy_1, strategy_2)
+
+    This ensures:
+    - Noise branches (Voronoi artefacts near corners) are removed
+    - Meaningful structural branches are preserved
+    - The threshold adapts to the polygon's scale
+    """
+    # Strategy 2: minimum floor based on densification distance
+    floor = densify_distance * 3.0
+
+    # Strategy 1: based on polygon width
+    total_skeleton_length = sum(
+        d.get('weight', 0.0) for _, _, d in G.edges(data=True)
+    )
+
+    if total_skeleton_length > 0:
+        area = _polygon_area(exterior, holes)
+        typical_width = area / total_skeleton_length
+        width_based = typical_width * 0.5
+    else:
+        width_based = 0.0
+
+    return max(width_based, floor)
+
+
+def _extract_auto_pruned_skeleton(
+    G: nx.Graph,
+    exterior: np.ndarray,
+    holes: list,
+    densify_distance: float,
+    user_prune_threshold: float = 0.0,
+) -> list:
+    """
+    Extract a branching centerline using automatic threshold pruning.
+
+    Unlike _extract_longest_path which returns only ONE path, this
+    automatically calculates an appropriate pruning threshold, removes
+    noise branches, and returns ALL remaining edges as the centerline.
+
+    If user_prune_threshold > 0, uses the larger of the auto-computed
+    and user-provided thresholds.
+
+    Returns list of (node_u, node_v) edge tuples.
+    """
+    # Step 1: Compute auto threshold
+    auto_threshold = _auto_prune_threshold(
+        G, exterior, holes, densify_distance
+    )
+
+    # Use the larger of auto and user-provided threshold
+    effective_threshold = max(auto_threshold, user_prune_threshold)
+
+    # Step 2: Prune branches
+    G = _prune_branches(G.copy(), effective_threshold)
+
+    if G.number_of_edges() == 0:
+        return []
+
+    # Step 3: Take largest connected component
+    if not nx.is_connected(G):
+        largest_cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(largest_cc).copy()
+
+    if G.number_of_edges() == 0:
+        return []
+
+    return [(u, v) for u, v in G.edges()]
 
 
 # ---------------------------------------------------------------------------
@@ -798,18 +915,26 @@ def _centerline_voronoi_fast(
     ]
     G.add_edges_from(edge_list)
 
+    if G.number_of_edges() == 0:
+        return None
+
+    if single_line:
+        # Use auto-threshold pruning to preserve meaningful branches
+        edges = _extract_auto_pruned_skeleton(
+            G, exterior, holes, actual_distance,
+            user_prune_threshold=prune_threshold,
+        )
+        if not edges:
+            return None
+        _report("Centerline extraction complete.", 100)
+        return edges
+
+    # For full skeleton mode, apply user pruning only
     if prune_threshold > 0:
         G = _prune_branches(G, prune_threshold)
 
     if G.number_of_edges() == 0:
         return None
-
-    if single_line:
-        path_nodes = _extract_longest_path(G)
-        if len(path_nodes) < 2:
-            return None
-        _report("Centerline extraction complete.", 100)
-        return list(path_nodes)
 
     _report("Centerline extraction complete.", 100)
     return [(u, v) for u, v in G.edges()]
@@ -1013,12 +1138,20 @@ def _centerline_skeleton_fast(
         return None
 
     if single_line:
-        _report("Extracting longest path ...", 90)
-        path_pixels = _extract_longest_path(G)
-        if len(path_pixels) < 2:
+        _report("Extracting auto-pruned skeleton ...", 90)
+        # For skeleton method, use resolution-based pruning
+        auto_threshold = resolution * 3.0
+        G_pruned = _prune_branches(G.copy(), auto_threshold)
+        if G_pruned.number_of_edges() == 0:
+            return None
+        # Take largest connected component
+        if not nx.is_connected(G_pruned):
+            largest_cc = max(nx.connected_components(G_pruned), key=len)
+            G_pruned = G_pruned.subgraph(largest_cc).copy()
+        if G_pruned.number_of_edges() == 0:
             return None
         _report("Centerline extraction complete.", 100)
-        return [G.nodes[p]["coord"] for p in path_pixels]
+        return [(G.nodes[u]["coord"], G.nodes[v]["coord"]) for u, v in G_pruned.edges()]
 
     _report("Centerline extraction complete.", 100)
     return [(G.nodes[u]["coord"], G.nodes[v]["coord"]) for u, v in G.edges()]
@@ -1107,8 +1240,6 @@ def polygon_to_centerline_wkt(
     if not all_results:
         return None
 
-    if single_line:
-        return _paths_to_wkt(all_results)
-
+    # Both modes now return edge lists
     all_edges = [edge for result in all_results for edge in result]
     return _edges_to_multilinestring_wkt(all_edges)

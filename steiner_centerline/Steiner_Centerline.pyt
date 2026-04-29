@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Fast_Centerline.pyt
-===================
-ArcGIS Python Toolbox that wraps the accelerated, shapely-free centerline
-algorithm implemented in ``centerline_fast.py``.
+Steiner_Centerline.pyt
+======================
+Steiner Tree Branching Centerline Toolbox — ArcGIS Python Toolbox that wraps
+the Steiner-tree-based centerline algorithm in ``centerline_steiner.py``.
 
-Why use this toolbox instead of ``pure_centerline/Pure_Centerline.pyt``?
-------------------------------------------------------------------------
-Both toolboxes share the same shapely-free design (no shapely, geopandas,
-or pandas), so neither triggers the "Tool not licensed" dependency conflict
-that plagued ``gdal_centerline/GDAL_Centerline.pyt``.
+Unlike ``fast_centerline/Fast_Centerline.pyt`` which extracts only the single
+longest path, this toolbox preserves ALL meaningful branches by computing a
+Steiner tree that connects all leaf nodes of the medial-axis graph.
 
-This toolbox is significantly faster on large or densely-sampled polygons
-because every geometry computation is performed with vectorised NumPy array
-operations rather than Python loops.  See ``centerline_fast.py`` for a
-detailed breakdown of all four acceleration techniques.
+The output is a branching ``MULTILINESTRING`` that faithfully represents the
+full skeleton topology of the input polygon.
 
 Runtime dependencies
 --------------------
-Same as ``pure_centerline``:
+Same as ``fast_centerline``:
     numpy    – pre-installed in every ArcGIS Pro Python environment.
     scipy    – usually pre-installed in ArcGIS Pro.
     networkx – install from conda-forge (see install_dependencies.bat):
@@ -33,10 +29,10 @@ For ``method=skeleton`` also install scikit-image:
 How to load this toolbox
 ------------------------
 In **ArcGIS Pro** (Catalog pane) or **ArcCatalog**:
-  1. Right-click a folder → Add Toolbox → select ``Fast_Centerline.pyt``.
-  2. Expand the toolbox and run **Polygon to Centerline (Fast)**.
+  1. Right-click a folder → Add Toolbox → select ``Steiner_Centerline.pyt``.
+  2. Expand the toolbox and run **Polygon to Centerline (Steiner Tree)**.
 
-``centerline_fast.py`` must be in the **same directory** as this ``.pyt``
+``centerline_steiner.py`` must be in the **same directory** as this ``.pyt``
 file so that it can be imported at run-time.
 """
 
@@ -102,20 +98,20 @@ _INSTALL_HELP = (
     "Missing: {missing}\n"
     "\n"
     "Quick fix — run 'install_dependencies.bat' found in the same\n"
-    "folder as this toolbox (fast_centerline/).  See README.md for\n"
+    "folder as this toolbox (steiner_centerline/).  See README.md for\n"
     "full instructions.\n"
     "\n"
     "Manual installation (ArcGIS Pro Python Command Prompt):\n"
     "\n"
     "  Step 1 — Clone the default environment (only once):\n"
-    "    conda create --name arcgispro-py3-fast --clone arcgispro-py3\n"
+    "    conda create --name arcgispro-py3-steiner --clone arcgispro-py3\n"
     "\n"
     "  Step 2 — Install networkx into the clone:\n"
-    "    activate arcgispro-py3-fast\n"
+    "    activate arcgispro-py3-steiner\n"
     "    conda install -c conda-forge -y networkx\n"
     "\n"
     "  Step 3 — Set the clone as the active environment in ArcGIS Pro:\n"
-    "    Project > Python > Python Environments > arcgispro-py3-fast\n"
+    "    Project > Python > Python Environments > arcgispro-py3-steiner\n"
     "    Restart ArcGIS Pro.\n"
     "\n"
     "  Note: numpy and scipy are usually already present in the default\n"
@@ -131,9 +127,9 @@ _INSTALL_HELP = (
 class Toolbox(object):
     def __init__(self):
         """Define the toolbox (the name of the toolbox is the name of the .pyt file)."""
-        self.label = "Fast Centerline"
-        self.alias = "FastCenterline"
-        self.tools = [PolygonToCenterlineFast]
+        self.label = "Steiner Centerline"
+        self.alias = "SteinerCenterline"
+        self.tools = [PolygonToCenterlineSteiner]
 
 
 # ---------------------------------------------------------------------------
@@ -141,32 +137,26 @@ class Toolbox(object):
 # ---------------------------------------------------------------------------
 
 
-class PolygonToCenterlineFast(object):
-    """ArcGIS tool that wraps the accelerated polygon_to_centerline_wkt()."""
+class PolygonToCenterlineSteiner(object):
+    """ArcGIS tool that wraps the Steiner-tree polygon_to_centerline_wkt()."""
 
     def __init__(self):
-        self.label = "Polygon to Centerline (Fast)"
+        self.label = "Polygon to Centerline (Steiner Tree)"
         self.description = (
-            "Converts polygon features to centerline polylines using an "
-            "accelerated, shapely-free open-source implementation.\n\n"
-            "This tool is significantly faster than 'Polygon to Centerline (Pure)' "
-            "on large or densely-sampled polygons because all geometry operations "
-            "are performed with vectorised NumPy array operations instead of "
-            "Python loops.\n\n"
-            "Four acceleration techniques are used:\n"
-            "  1. Vectorised densification (numpy arange/broadcasting replaces the\n"
-            "     innermost interpolation loop).\n"
-            "  2. Batch Voronoi ridge filtering — all M ridges are tested against\n"
-            "     all K ring edges in a single (M x K) numpy broadcast; no Python\n"
-            "     loop over ridges.\n"
-            "  3. Vectorised rasterisation — all pixels tested at once using\n"
-            "     matplotlib.path.Path (C extension) or numpy 2-D broadcast.\n"
-            "  4. Vectorised skeleton graph construction — edge discovery via numpy\n"
-            "     shift-and-intersect; all edges added in one batch call.\n\n"
-            "Like the Pure toolbox, this tool requires only numpy (pre-installed),\n"
-            "scipy (usually pre-installed), and networkx (conda-forge).  No shapely,\n"
-            "geopandas, or pandas are required, so it works with any ArcGIS licence\n"
-            "level (Basic / Standard / Advanced) without dependency conflicts.\n\n"
+            "Converts polygon features to branching centerline polylines using "
+            "a Steiner tree approximation that preserves ALL meaningful branches "
+            "of the medial-axis graph.\n\n"
+            "Unlike the 'Fast' tool which extracts only the single longest path "
+            "(losing all branches), this tool computes a Steiner tree connecting "
+            "all leaf nodes, producing a MULTILINESTRING that faithfully represents "
+            "the full skeleton topology of the input polygon.\n\n"
+            "Uses the same four acceleration techniques as the Fast tool:\n"
+            "  1. Vectorised densification.\n"
+            "  2. Batch Voronoi ridge filtering.\n"
+            "  3. Vectorised rasterisation.\n"
+            "  4. Vectorised skeleton graph construction.\n\n"
+            "Requires only numpy (pre-installed), scipy (usually pre-installed),\n"
+            "and networkx (conda-forge).  No shapely, geopandas, or pandas required.\n\n"
             "Two algorithms:\n"
             "  voronoi  — Vector-based Voronoi / Thiessen skeleton (default).\n"
             "  skeleton — Raster-based morphological thinning (requires scikit-image)."
@@ -247,7 +237,7 @@ class PolygonToCenterlineFast(object):
         p_res.category = "Skeleton Options"
 
         p_full = arcpy.Parameter(
-            displayName="Return Full Skeleton (may contain branches / forks)",
+            displayName="Return Full Raw Skeleton (ignoring Steiner tree filtering)",
             name="full_skeleton",
             datatype="GPBoolean",
             parameterType="Optional",
@@ -311,7 +301,7 @@ class PolygonToCenterlineFast(object):
     # ------------------------------------------------------------------
 
     def execute(self, parameters, messages):
-        """Run the fast centerline algorithm."""
+        """Run the Steiner centerline algorithm."""
 
         tbx_dir = os.path.dirname(os.path.abspath(__file__))
         if tbx_dir not in sys.path:
@@ -340,11 +330,11 @@ class PolygonToCenterlineFast(object):
 
         # ---- Import fast algorithm -----------------------------------------
         try:
-            from centerline_fast import polygon_to_centerline_wkt
+            from centerline_steiner import polygon_to_centerline_wkt
         except ImportError:
             messages.addErrorMessage(
-                "Could not import 'centerline_fast' module.\n"
-                "Ensure 'centerline_fast.py' is in the same folder as this toolbox:\n"
+                "Could not import 'centerline_steiner' module.\n"
+                "Ensure 'centerline_steiner.py' is in the same folder as this toolbox:\n"
                 "  {}".format(tbx_dir)
             )
             raise

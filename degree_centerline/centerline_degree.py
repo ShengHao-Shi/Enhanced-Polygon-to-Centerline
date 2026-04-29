@@ -1,8 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-centerline_fast.py
-==================
-Accelerated, shapely-free polygon-to-centerline algorithm for ArcGIS Pro.
+centerline_degree.py
+====================
+Degree-aware branching centerline — Plan C from BRANCHING_ANALYSIS.md.
+
+Based on ``fast_centerline/centerline_fast.py`` (same vectorised Voronoi
+pipeline) but replaces ``_extract_longest_path`` with a **degree-aware
+segment decomposition** that preserves all meaningful branches.
+
+Algorithm (``_extract_branching_skeleton``):
+
+  1. Identify **key nodes** — leaves (degree 1) and junctions (degree ≥ 3).
+  2. Decompose the graph into **segments** — chains of degree-2 nodes
+     connecting pairs of key nodes.
+  3. Filter short terminal segments using a ratio-based threshold
+     (``min_branch_ratio`` × reference length, where reference length is
+     the larger of the single longest segment and 50 % of the total
+     skeleton length).  This prevents long branches from being
+     accidentally discarded.
+  4. Always keep **internal** segments (junction → junction).
+  4b. Remove terminal branches near obtuse polygon vertices, but protect
+      branches whose length ≥ 20 % of the total skeleton length.
+  5. Return all surviving edges as ``MULTILINESTRING``.
+
+Advantages over the Steiner-tree approach (Plan A):
+  • O(V + E) linear-time graph traversal — no expensive all-pairs shortest
+    paths or NP-hard approximation.
+  • Built-in adaptive noise filtering — ratio threshold automatically
+    adjusts to the polygon's scale.
+  • No extra networkx algorithms required beyond basic graph operations.
 
 No shapely, geopandas, or pandas required.  Same dependencies as
 ``pure_centerline/centerline_pure.py`` (numpy, scipy, networkx) plus the
@@ -161,6 +187,16 @@ _MAX_DENSIFY_POINTS = 10_000
 # Together with _CHUNK_SIZE (M dimension), limits peak memory to
 # approximately _CHUNK_SIZE × _RING_CHUNK_SIZE × 48 bytes ≈ 384 MB (Plan C).
 _RING_CHUNK_SIZE = 4096
+
+# Fraction of total skeleton length used as the minimum reference for
+# ratio-based terminal-branch filtering.  Ensures that the filter considers
+# the overall skeleton scale, not just the single longest segment.
+_SKELETON_LENGTH_REFERENCE_FRACTION = 0.5
+
+# Terminal branches whose length is at least this fraction of the total
+# skeleton length are protected from the obtuse-angle contour filter,
+# because they likely represent meaningful structural features.
+_LONG_BRANCH_PROTECT_RATIO = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +710,410 @@ def _extract_longest_path(G: nx.Graph) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Plan C – Degree-aware branching skeleton extraction
+# ---------------------------------------------------------------------------
+
+
+def _vertex_interior_angle(ring: np.ndarray, idx: int) -> float:
+    """Return the unsigned angle (degrees) between the two edges at vertex *idx*.
+
+    *ring* is a closed polygon ring (first == last).  The returned value is
+    the included angle between the incoming and outgoing edges, in [0, 180].
+    This is sufficient for detecting obtuse polygon corners (angle > threshold)
+    regardless of ring winding direction.
+    """
+    n = len(ring) - 1  # number of unique vertices (last == first)
+    if n < 3:
+        return 180.0
+    prev_idx = (idx - 1) % n
+    next_idx = (idx + 1) % n
+    v = ring[idx]
+    a = ring[prev_idx] - v
+    b = ring[next_idx] - v
+    dot = float(a[0] * b[0] + a[1] * b[1])
+    cross = float(a[0] * b[1] - a[1] * b[0])
+    angle_rad = math.atan2(abs(cross), dot)
+    return math.degrees(angle_rad)
+
+
+def _ray_ring_intersection(origin: np.ndarray, direction: np.ndarray,
+                           ring: np.ndarray) -> Optional[np.ndarray]:
+    """Find the nearest intersection of a ray with a polygon ring.
+
+    Parameters
+    ----------
+    origin : (2,) array — ray start point.
+    direction : (2,) array — unit direction vector.
+    ring : (V, 2) array — closed polygon ring.
+
+    Returns
+    -------
+    (2,) array — nearest intersection point, or None.
+    """
+    # Vectorised ray–segment intersection for all ring edges at once.
+    p = ring[:-1]             # (K, 2) — segment start points
+    q = ring[1:]              # (K, 2) — segment end points
+    d = q - p                 # (K, 2) — segment directions
+
+    ox, oy = float(origin[0]), float(origin[1])
+    dx, dy = float(direction[0]), float(direction[1])
+
+    # Solve: origin + t * direction = p + s * d
+    #   t = cross(p - origin, d) / cross(direction, d)
+    #   s = cross(p - origin, direction) / cross(direction, d)
+    denom = dx * d[:, 1] - dy * d[:, 0]  # cross(direction, d)  (K,)
+
+    # Avoid division by zero (parallel segments)
+    parallel = np.abs(denom) < 1e-12
+    safe_denom = np.where(parallel, 1.0, denom)
+
+    po = p - origin  # (K, 2)
+    t_num = po[:, 0] * d[:, 1] - po[:, 1] * d[:, 0]    # cross(po, d)
+    s_num = po[:, 0] * dy - po[:, 1] * dx               # cross(po, direction)
+
+    t = t_num / safe_denom
+    s = s_num / safe_denom
+
+    # Valid: t > small epsilon (forward along ray) and 0 <= s <= 1 (on segment)
+    valid = (~parallel) & (t > 1e-9) & (s >= 0.0) & (s <= 1.0)
+
+    if not valid.any():
+        return None
+
+    t_valid = np.where(valid, t, np.inf)
+    best = int(np.argmin(t_valid))
+    if t_valid[best] == np.inf:
+        return None
+    return origin + t_valid[best] * direction
+
+
+def _extend_leaves_to_boundary(edges: list,
+                               exterior: np.ndarray,
+                               holes: list,
+                               k: int = 3) -> list:
+    """Extend every leaf node of the skeleton to the nearest polygon boundary.
+
+    Uses *k* nodes along the skeleton from each leaf to fit a direction via
+    least-squares, then ray-casts to the polygon boundary.
+
+    Parameters
+    ----------
+    edges : list of ((x1,y1), (x2,y2)) tuples
+    exterior : (N, 2) closed exterior ring.
+    holes : list of (M, 2) closed hole rings.
+    k : int — number of nodes to walk from each leaf for direction fitting.
+
+    Returns
+    -------
+    Extended edge list (original edges + new extension edges).
+    """
+    if not edges:
+        return edges
+
+    # Build a temporary graph from the edge list
+    G = nx.Graph()
+    for u, v in edges:
+        w = math.hypot(v[0] - u[0], v[1] - u[1])
+        G.add_edge(u, v, weight=w)
+
+    leaves = [n for n in G.nodes() if G.degree(n) == 1]
+    if not leaves:
+        return edges
+
+    new_edges = list(edges)
+    rings = [exterior] + holes
+
+    for leaf in leaves:
+        # Walk up to k nodes from leaf along the skeleton
+        path = [leaf]
+        current = leaf
+        for _ in range(k):
+            neighbors = [nb for nb in G.neighbors(current) if nb not in path]
+            if not neighbors:
+                break
+            # Pick the neighbor (degree-2 chains have exactly one option)
+            nxt = neighbors[0]
+            path.append(nxt)
+            current = nxt
+
+        if len(path) < 2:
+            continue
+
+        # Fit direction from the collected path points
+        pts = np.array(path, dtype=float)  # (m, 2)
+        if len(pts) >= 3:
+            # Least-squares line fit: direction = eigenvector of covariance
+            # with largest eigenvalue
+            centroid = pts.mean(axis=0)
+            centered = pts - centroid
+            cov = centered.T @ centered
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            # Principal direction = eigenvector with largest eigenvalue
+            direction = eigvecs[:, np.argmax(eigvals)].copy()  # (2,)
+        else:
+            # Only 2 points: direction = leaf → neighbor (outward)
+            direction = pts[0] - pts[1]
+
+        norm = np.hypot(direction[0], direction[1])
+        if norm < 1e-12:
+            continue
+        direction /= norm
+
+        # Ensure direction points outward (away from the skeleton interior)
+        # The outward direction is from pts[1] toward pts[0] (leaf)
+        outward = pts[0] - pts[1]
+        if np.dot(direction, outward) < 0:
+            direction = -direction
+
+        # Ray-cast from the leaf to the polygon boundary
+        leaf_pt = np.array(leaf, dtype=float)
+        best_hit = None
+        best_dist = np.inf
+
+        for ring in rings:
+            hit = _ray_ring_intersection(leaf_pt, direction, ring)
+            if hit is not None:
+                d = np.hypot(hit[0] - leaf_pt[0], hit[1] - leaf_pt[1])
+                if d < best_dist:
+                    best_dist = d
+                    best_hit = hit
+
+        if best_hit is not None and best_dist > 1e-9:
+            new_edges.append((leaf, (float(best_hit[0]), float(best_hit[1]))))
+
+    return new_edges
+
+
+def _extract_branching_skeleton(G: nx.Graph, min_branch_ratio: float = 0.1,
+                                densify_distance: float = 1.0,
+                                exterior: Optional[np.ndarray] = None,
+                                obtuse_angle_threshold: float = 150.0) -> list:
+    """Decompose the skeleton graph by topology and filter noise segments.
+
+    Algorithm
+    ---------
+    1. Pre-prune very short noise spurs (< 3 × *densify_distance*) so that
+       Voronoi tessellation artefacts near polygon corners are removed before
+       the topological decomposition.
+    2. Identify *key nodes* — leaves (degree 1) and junctions (degree ≥ 3).
+    3. Walk degree-2 chains between key nodes to build a list of *segments*
+       (each segment is a node-path with a cumulative weight).
+    4. Drop short **terminal** segments (leaf→junction) whose length is less
+       than ``min_branch_ratio × reference_length``, where reference_length
+       is ``max(max_segment_length, total_skeleton_length * 0.5)``.  This
+       uses total skeleton length as context so that long branches relative
+       to the overall skeleton are preserved.  Internal segments
+       (junction→junction) are always kept.
+    4b. Remove terminal branches near obtuse polygon vertices, but **protect**
+        branches whose length ≥ 20 % of the total skeleton length to avoid
+        discarding genuinely long structural branches.
+    5. If filtering disconnects the graph, keep only the largest connected
+       component of the retained edges.
+    6. Return all surviving edges as ``[(u, v), …]``.
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Weighted skeleton graph (nodes are (x, y) coordinate tuples).
+    min_branch_ratio : float
+        Fraction of the reference length below which terminal branches are
+        considered noise and removed.  Default 0.1 (10 %).
+    densify_distance : float
+        Densification distance used for Voronoi construction.  Used to
+        compute the pre-prune threshold (3 × densify_distance).
+    exterior : np.ndarray or None
+        Closed exterior ring (N, 2) of the polygon.  When provided,
+        terminal branches whose leaf node is near an obtuse polygon vertex
+        (interior angle > *obtuse_angle_threshold*) are removed as
+        non-structural artefacts — unless the branch is long enough to be
+        protected (≥ 20 % of total skeleton length).
+    obtuse_angle_threshold : float
+        Interior angle (degrees) above which a polygon vertex is considered
+        obtuse.  Terminal branches pointing toward such vertices are removed.
+        Default 150.0.
+
+    Returns
+    -------
+    list of (node_u, node_v) edge tuples.
+    """
+    # -- Step 0: pre-prune very short noise spurs ----------------------------
+    pre_prune_threshold = 3.0 * densify_distance
+    G = _prune_branches(G.copy(), pre_prune_threshold)
+
+    if G.number_of_edges() == 0:
+        return []
+
+    # -- Step 1: largest connected component ---------------------------------
+    if not nx.is_connected(G):
+        largest_cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(largest_cc).copy()
+
+    if G.number_of_nodes() < 2:
+        return []
+
+    # -- Step 2: identify key nodes ------------------------------------------
+    leaves = set(n for n in G.nodes() if G.degree(n) == 1)
+    junctions = set(n for n in G.nodes() if G.degree(n) >= 3)
+    key_nodes = leaves | junctions
+
+    # Special case: pure chain (no junctions, 0 or 2 leaves) → return all
+    if not junctions:
+        # No branching structure; return all edges directly
+        return [(u, v) for u, v in G.edges()]
+
+    # Special case: pure cycle (no leaves, no junctions, all degree-2)
+    if not key_nodes:
+        return [(u, v) for u, v in G.edges()]
+
+    # -- Step 3: decompose into segments -------------------------------------
+    segments = []         # list of dicts with path / length / endpoints
+    visited_edges = set()
+
+    for start in key_nodes:
+        if start not in G:
+            continue
+        for neighbor in G.neighbors(start):
+            edge = frozenset({start, neighbor})
+            if edge in visited_edges:
+                continue
+
+            # Walk along degree-2 nodes until we reach another key node
+            path = [start]
+            total_len = G[start][neighbor].get("weight", 0.0)
+            visited_edges.add(edge)
+
+            prev = start
+            current = neighbor
+            while current not in key_nodes:
+                path.append(current)
+                nxt = next(
+                    (nb for nb in G.neighbors(current) if nb != prev), None
+                )
+                if nxt is None:
+                    break  # dead end (shouldn't happen in well-formed graph)
+                e = frozenset({current, nxt})
+                if e in visited_edges:
+                    break
+                total_len += G[current][nxt].get("weight", 0.0)
+                visited_edges.add(e)
+                prev = current
+                current = nxt
+
+            path.append(current)
+            segments.append({
+                "path": path,
+                "length": total_len,
+                "start": start,
+                "end": current,
+            })
+
+    if not segments:
+        return [(u, v) for u, v in G.edges()]
+
+    # -- Step 4: filter short terminal segments ------------------------------
+    # Use the total skeleton length as the reference for ratio-based
+    # filtering instead of just the single longest segment.  This prevents
+    # long branches from being discarded simply because one segment happens
+    # to be disproportionately long.
+    total_skeleton_length = sum(seg["length"] for seg in segments)
+    max_len = max(seg["length"] for seg in segments)
+    # reference_length: blend of max-segment and total-skeleton so that
+    # very long branches relative to the skeleton are preserved.
+    reference_length = max(max_len,
+                          total_skeleton_length * _SKELETON_LENGTH_REFERENCE_FRACTION)
+    min_length = reference_length * min_branch_ratio
+
+    kept = []
+    for seg in segments:
+        is_internal = (seg["start"] in junctions and seg["end"] in junctions)
+        if is_internal or seg["length"] >= min_length:
+            kept.append(seg)
+
+    if not kept:
+        # Filtering removed everything — fall back to the longest segment
+        longest = max(segments, key=lambda s: s["length"])
+        kept = [longest]
+
+    # -- Step 4b: obtuse-angle contour filter --------------------------------
+    # Remove terminal branches whose leaf node is near an obtuse polygon
+    # vertex.  These are Voronoi artefacts caused by gentle bends in the
+    # polygon outline, not genuine structural branches.
+    # Length-protection: branches that are long relative to the total
+    # skeleton are preserved even if they point toward an obtuse corner,
+    # because they likely represent meaningful structural features.
+    if exterior is not None and len(exterior) > 3:
+        ring = np.asarray(exterior, dtype=float)
+        n_verts = len(ring) - 1  # unique vertices (ring is closed)
+        if n_verts >= 3:
+            # Pre-compute interior angles for all polygon vertices
+            angles = np.empty(n_verts, dtype=float)
+            for vi in range(n_verts):
+                angles[vi] = _vertex_interior_angle(ring, vi)
+            unique_verts = ring[:n_verts]  # (n_verts, 2)
+
+            kept2 = []
+            for seg in kept:
+                is_internal = (seg["start"] in junctions
+                               and seg["end"] in junctions)
+                if is_internal:
+                    kept2.append(seg)
+                    continue
+
+                # Length protection: long branches are always kept
+                if (total_skeleton_length > 0
+                        and seg["length"] / total_skeleton_length
+                        >= _LONG_BRANCH_PROTECT_RATIO):
+                    kept2.append(seg)
+                    continue
+
+                # Identify the leaf end of this terminal segment
+                if seg["start"] in leaves:
+                    leaf_pt = np.array(seg["start"], dtype=float)
+                elif seg["end"] in leaves:
+                    leaf_pt = np.array(seg["end"], dtype=float)
+                else:
+                    kept2.append(seg)
+                    continue
+
+                # Find nearest polygon vertex to this leaf
+                dists = np.hypot(unique_verts[:, 0] - leaf_pt[0],
+                                 unique_verts[:, 1] - leaf_pt[1])
+                nearest_idx = int(np.argmin(dists))
+                vertex_angle = angles[nearest_idx]
+
+                if vertex_angle > obtuse_angle_threshold:
+                    # This branch points toward an obtuse corner — remove it
+                    continue
+                kept2.append(seg)
+
+            if kept2:
+                kept = kept2
+            # else: keep original 'kept' to avoid empty result
+
+    # -- Step 5: rebuild edge list from kept segments ------------------------
+    edge_set = set()
+    for seg in kept:
+        path = seg["path"]
+        for i in range(len(path) - 1):
+            # Use frozenset to avoid (u,v) / (v,u) duplication
+            edge_set.add(frozenset({path[i], path[i + 1]}))
+
+    # Ensure connectivity: build a subgraph, take the largest component
+    G_kept = G.edge_subgraph(
+        [(u, v) for u, v in G.edges() if frozenset({u, v}) in edge_set]
+    ).copy()
+
+    if G_kept.number_of_edges() == 0:
+        return []
+
+    if not nx.is_connected(G_kept):
+        largest_cc = max(nx.connected_components(G_kept), key=len)
+        G_kept = G_kept.subgraph(largest_cc).copy()
+
+    return [(u, v) for u, v in G_kept.edges()]
+
+
+# ---------------------------------------------------------------------------
 # Method A – Vectorised Voronoi skeleton
 # ---------------------------------------------------------------------------
 
@@ -805,11 +1245,15 @@ def _centerline_voronoi_fast(
         return None
 
     if single_line:
-        path_nodes = _extract_longest_path(G)
-        if len(path_nodes) < 2:
+        # Plan C: degree-aware branching skeleton extraction
+        edges = _extract_branching_skeleton(G, densify_distance=actual_distance,
+                                            exterior=exterior)
+        if not edges:
             return None
+        # Extend leaf nodes to polygon boundary (Solution 1-B)
+        edges = _extend_leaves_to_boundary(edges, exterior, holes)
         _report("Centerline extraction complete.", 100)
-        return list(path_nodes)
+        return edges
 
     _report("Centerline extraction complete.", 100)
     return [(u, v) for u, v in G.edges()]
@@ -1013,12 +1457,12 @@ def _centerline_skeleton_fast(
         return None
 
     if single_line:
-        _report("Extracting longest path ...", 90)
-        path_pixels = _extract_longest_path(G)
-        if len(path_pixels) < 2:
+        _report("Extracting branching skeleton ...", 90)
+        edges = _extract_branching_skeleton(G, densify_distance=resolution)
+        if not edges:
             return None
         _report("Centerline extraction complete.", 100)
-        return [G.nodes[p]["coord"] for p in path_pixels]
+        return [(G.nodes[u]["coord"], G.nodes[v]["coord"]) for u, v in edges]
 
     _report("Centerline extraction complete.", 100)
     return [(G.nodes[u]["coord"], G.nodes[v]["coord"]) for u, v in G.edges()]
@@ -1041,11 +1485,10 @@ def polygon_to_centerline_wkt(
     max_densify_points: int = _MAX_DENSIFY_POINTS,
 ) -> Optional[str]:
     """
-    Convert a polygon WKT string to a centerline WKT string — accelerated.
+    Convert a polygon WKT string to a branching centerline WKT string.
 
-    The function signature and return values are identical to
-    ``centerline_pure.polygon_to_centerline_wkt``; see that module for full
-    parameter documentation.
+    Uses degree-aware skeleton decomposition (Plan C) to preserve all
+    meaningful branches while filtering out Voronoi noise.
 
     All geometry computations are fully vectorised with numpy; no shapely,
     geopandas, or pandas are required.  See module docstring for a detailed
@@ -1054,22 +1497,19 @@ def polygon_to_centerline_wkt(
     Parameters
     ----------
     progress_callback : callable or None
-        Optional callback for progress reporting (Plan G).  When provided,
+        Optional callback for progress reporting.  When provided,
         called as ``progress_callback(message, percentage)`` at each major
         processing stage.  *message* is a human-readable status string;
         *percentage* is an integer 0–100 (or -1 if indeterminate).
-        The callback may be used by the ArcGIS Toolbox to update the
-        progressor label and display elapsed time.
     max_densify_points : int
         Maximum number of densified boundary points before adaptive
-        adjustment increases ``densify_distance`` automatically (Plan D).
+        adjustment increases ``densify_distance`` automatically.
         Default is 10,000.
 
     Returns
     -------
     str or None
-        WKT ``LINESTRING`` or ``MULTILINESTRING``, or None for degenerate
-        or empty input.
+        WKT ``MULTILINESTRING``, or None for degenerate or empty input.
     """
     polygons = _parse_wkt_polygon(wkt)
     if not polygons:
@@ -1107,8 +1547,6 @@ def polygon_to_centerline_wkt(
     if not all_results:
         return None
 
-    if single_line:
-        return _paths_to_wkt(all_results)
-
+    # Both single_line modes now return edge lists → MULTILINESTRING
     all_edges = [edge for result in all_results for edge in result]
     return _edges_to_multilinestring_wkt(all_edges)

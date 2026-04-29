@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xml:lang="en">
+  <Esri>
+    <CreaDate>20260318</CreaDate>
+    <CreaTime>00000000</CreaTime>
+    <ArcGISFormat>1.0</ArcGISFormat>
+    <ArcGISProfile>ItemDescription</ArcGISProfile>
+  </Esri>
+  <tool name="PolygonToCenterlineDegree" displayname="Polygon to Centerline (Degree-Aware)" toolboxalias="DegreeCenterline">
+    <summary>Converts polygon features to branching centerline polylines using degree-aware Voronoi skeleton decomposition that preserves all meaningful branches.</summary>
+    <usage>Run this tool on a polygon feature layer to extract a branching centerline (MULTILINESTRING). The degree-aware algorithm decomposes the Voronoi skeleton into topological segments and filters noise branches automatically.</usage>
+    <parameters>
+      <param name="in_features" displayname="Input Polygon Features" type="Required" direction="Input" datatype="GPFeatureLayer" expression="in_features">
+        <dialogReference>The input polygon feature layer or feature class whose shapes will be converted to centerline polylines. Each polygon is processed independently.</dialogReference>
+      </param>
+      <param name="out_features" displayname="Output Centerline Features" type="Required" direction="Output" datatype="DEFeatureClass" expression="out_features">
+        <dialogReference>Path to the output polyline feature class. Each output feature is a MULTILINESTRING representing the branching centerline of the corresponding input polygon. Attribute fields from the input are copied over, plus an ORIG_FID field.</dialogReference>
+      </param>
+      <param name="densify_distance" displayname="Densification Distance (CRS units)" type="Optional" direction="Input" datatype="GPDouble" expression="densify_distance">
+        <dialogReference>Maximum spacing (in CRS map units) between boundary vertices before Voronoi tessellation. Smaller values produce a more detailed centerline but increase computation time and memory usage. Recommended range: 0.5 - 5.0. Use 0.5 - 1.0 for small or detailed polygons; use 2.0 - 5.0 for large or simple polygons. Must be greater than 0. Default: 1.0.</dialogReference>
+      </param>
+      <param name="prune_threshold" displayname="Branch Prune Threshold (CRS units; 0 = no pruning)" type="Optional" direction="Input" datatype="GPDouble" expression="prune_threshold">
+        <dialogReference>Minimum branch length (in CRS map units) to keep after initial skeleton construction. Branches shorter than this value are pruned as noise. Set to 0 to skip explicit pruning and rely solely on the degree-aware ratio-based filtering. Recommended range: 0 - 10.0. Use 0 (default) for automatic filtering; 1.0 - 5.0 for light cleanup; 5.0 - 10.0 for aggressive pruning. Must be greater than or equal to 0. Default: 0.0.</dialogReference>
+      </param>
+      <param name="full_skeleton" displayname="Return Full Raw Skeleton (skip degree-aware filtering)" type="Optional" direction="Input" datatype="GPBoolean" expression="full_skeleton">
+        <dialogReference>When checked (True), returns ALL Voronoi skeleton edges inside the polygon without degree-aware branch filtering, producing the raw medial-axis graph which may contain many short noise branches. When unchecked (False, default), the degree-aware algorithm decomposes the skeleton into topological segments and filters out short terminal branches, producing a clean branching centerline. Default: False (unchecked).</dialogReference>
+      </param>
+      <param name="max_densify_points" displayname="Max Densify Points" type="Optional" direction="Input" datatype="GPLong" expression="max_densify_points">
+        <dialogReference>Upper limit on the number of densified boundary points. If the polygon perimeter divided by Densification Distance would exceed this cap, the distance is automatically increased to stay within the limit. This prevents excessive memory usage on very large polygons. Recommended range: 5,000 - 100,000. Use 10,000 (default) for a good balance of detail and speed; 5,000 for faster processing with less detail; 50,000 - 100,000 for more detail (requires more RAM). Must be greater than or equal to 1. Default: 10,000.</dialogReference>
+      </param>
+    </parameters>
+  </tool>
+</metadata>

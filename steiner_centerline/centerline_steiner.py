@@ -1,20 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-centerline_fast.py
-==================
-Accelerated, shapely-free polygon-to-centerline algorithm for ArcGIS Pro.
+centerline_steiner.py
+=====================
+Steiner Tree Branching Centerline — accelerated, shapely-free polygon-to-
+centerline algorithm for ArcGIS Pro that preserves ALL meaningful branches.
+
+Unlike ``fast_centerline/centerline_fast.py`` which extracts only the single
+longest path (losing all branches), this module uses a **Steiner tree**
+approximation to connect all leaf nodes of the medial-axis graph, producing
+a branching ``MULTILINESTRING`` that faithfully represents the full skeleton
+topology of the input polygon.
 
 No shapely, geopandas, or pandas required.  Same dependencies as
-``pure_centerline/centerline_pure.py`` (numpy, scipy, networkx) plus the
+``fast_centerline/centerline_fast.py`` (numpy, scipy, networkx) plus the
 optional matplotlib for even faster rasterisation.
 
-Speed Improvements Over ``pure_centerline/centerline_pure.py``
---------------------------------------------------------------
-The baseline ``centerline_pure.py`` replaced every shapely call with pure-
-Python loops, which is correct but slow for large or densely-sampled polygons.
-This module keeps the same algorithm and the identical public API but
-replaces every Python loop with bulk NumPy array operations.  Four
-independent acceleration techniques are used:
+Speed Improvements (inherited from ``centerline_fast.py``)
+----------------------------------------------------------
+This module inherits the same four acceleration techniques used in
+``centerline_fast.py``.  See that module for the full baseline comparison.
+Four independent acceleration techniques are used:
 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  Technique 1 – Vectorised Densification                                 │
@@ -109,8 +114,19 @@ independent acceleration techniques are used:
 │  Speedup: 4–8× over the baseline.                                       │
 └─────────────────────────────────────────────────────────────────────────┘
 
-Public API (identical to ``centerline_pure.polygon_to_centerline_wkt``)
------------------------------------------------------------------------
+Key Difference — Steiner Tree Extraction
+-----------------------------------------
+When ``single_line=True``, ``centerline_fast.py`` calls ``_extract_longest_path``
+which returns only ONE path between the two farthest leaf nodes — all branches
+are lost.  This module instead calls ``_extract_steiner_tree`` which computes a
+Steiner-tree approximation connecting ALL leaf nodes of the medial-axis graph,
+preserving every meaningful branch.
+
+The output when ``single_line=True`` is now a ``MULTILINESTRING`` (edges of the
+Steiner tree) rather than a single ``LINESTRING``.
+
+Public API
+----------
     result_wkt = polygon_to_centerline_wkt(
         wkt,                        # WKT string of the input polygon
         method="voronoi",           # "voronoi" or "skeleton"
@@ -120,7 +136,7 @@ Public API (identical to ``centerline_pure.polygon_to_centerline_wkt``)
         raster_resolution=None,
         single_line=True,
     )
-    # Returns a WKT LINESTRING / MULTILINESTRING string, or None.
+    # Returns a WKT MULTILINESTRING string, or None.
 """
 
 from __future__ import annotations
@@ -673,6 +689,74 @@ def _extract_longest_path(G: nx.Graph) -> list:
     return path2.get(v, [u, v])
 
 
+def _extract_steiner_tree(G: nx.Graph, densify_distance: float) -> list:
+    """
+    Extract a branching centerline using Steiner tree approximation.
+
+    Unlike _extract_longest_path which returns only ONE path between the
+    two farthest endpoints, this preserves ALL meaningful branches by
+    computing a Steiner tree that connects all leaf nodes (degree-1 nodes).
+
+    Steps:
+    1. Pre-prune short noise branches (< 3 × densify_distance)
+    2. Take largest connected component
+    3. Find all leaf nodes (degree == 1)
+    4. Compute approximate Steiner tree connecting all leaves
+    5. Return all edges of the Steiner tree
+
+    Returns list of ((x1,y1), (x2,y2)) edge tuples.
+    """
+    # Step 1: Pre-prune short noise branches
+    # 3× densify_distance filters spurs shorter than the typical Voronoi cell
+    # diagonal, which are almost always tessellation artefacts rather than
+    # meaningful medial-axis branches.
+    pre_prune_threshold = 3.0 * densify_distance
+    G = _prune_branches(G.copy(), pre_prune_threshold)
+
+    if G.number_of_edges() == 0:
+        return []
+
+    # Step 2: Take largest connected component
+    if not nx.is_connected(G):
+        largest_cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(largest_cc).copy()
+
+    if G.number_of_nodes() < 2:
+        return []
+
+    # Step 3: Find leaf nodes
+    leaves = [n for n in G.nodes() if G.degree(n) == 1]
+
+    # Handle special cases
+    if not leaves:
+        # Pure cycle - return all edges
+        if all(G.degree(n) == 2 for n in G.nodes()):
+            return [(u, v) for u, v in G.edges()]
+        # No leaves but has junctions - use all nodes as potential terminals
+        leaves = list(G.nodes())
+
+    if len(leaves) < 2:
+        # Fall back to longest path for degenerate cases
+        path = _extract_longest_path(G)
+        if len(path) < 2:
+            return []
+        return [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+
+    # Step 4: Compute Steiner tree
+    try:
+        st = nx.approximation.steiner_tree(G, leaves, weight='weight')
+    except Exception:
+        # Steiner tree can fail on degenerate graphs (e.g. disconnected
+        # terminal sets after pruning); fall back to the full edge set.
+        return [(u, v) for u, v in G.edges()]
+
+    if st.number_of_edges() == 0:
+        return []
+
+    # Step 5: Return all edges
+    return [(u, v) for u, v in st.edges()]
+
+
 # ---------------------------------------------------------------------------
 # Method A – Vectorised Voronoi skeleton
 # ---------------------------------------------------------------------------
@@ -805,11 +889,12 @@ def _centerline_voronoi_fast(
         return None
 
     if single_line:
-        path_nodes = _extract_longest_path(G)
-        if len(path_nodes) < 2:
+        # Use Steiner tree to preserve branching structure
+        edges = _extract_steiner_tree(G, actual_distance)
+        if not edges:
             return None
         _report("Centerline extraction complete.", 100)
-        return list(path_nodes)
+        return edges
 
     _report("Centerline extraction complete.", 100)
     return [(u, v) for u, v in G.edges()]
@@ -1013,12 +1098,12 @@ def _centerline_skeleton_fast(
         return None
 
     if single_line:
-        _report("Extracting longest path ...", 90)
-        path_pixels = _extract_longest_path(G)
-        if len(path_pixels) < 2:
+        _report("Extracting Steiner tree ...", 90)
+        edges = _extract_steiner_tree(G, resolution)
+        if not edges:
             return None
         _report("Centerline extraction complete.", 100)
-        return [G.nodes[p]["coord"] for p in path_pixels]
+        return [(G.nodes[u]["coord"], G.nodes[v]["coord"]) for u, v in edges]
 
     _report("Centerline extraction complete.", 100)
     return [(G.nodes[u]["coord"], G.nodes[v]["coord"]) for u, v in G.edges()]
@@ -1041,11 +1126,13 @@ def polygon_to_centerline_wkt(
     max_densify_points: int = _MAX_DENSIFY_POINTS,
 ) -> Optional[str]:
     """
-    Convert a polygon WKT string to a centerline WKT string — accelerated.
+    Convert a polygon WKT string to a branching centerline WKT string.
 
-    The function signature and return values are identical to
-    ``centerline_pure.polygon_to_centerline_wkt``; see that module for full
-    parameter documentation.
+    Uses a Steiner tree approximation to preserve all meaningful branches
+    of the medial-axis graph.  When ``single_line=True``, the result is a
+    ``MULTILINESTRING`` containing the edges of the Steiner tree (unlike
+    ``centerline_fast.polygon_to_centerline_wkt`` which returns a single
+    ``LINESTRING``).
 
     All geometry computations are fully vectorised with numpy; no shapely,
     geopandas, or pandas are required.  See module docstring for a detailed
@@ -1054,22 +1141,19 @@ def polygon_to_centerline_wkt(
     Parameters
     ----------
     progress_callback : callable or None
-        Optional callback for progress reporting (Plan G).  When provided,
+        Optional callback for progress reporting.  When provided,
         called as ``progress_callback(message, percentage)`` at each major
         processing stage.  *message* is a human-readable status string;
         *percentage* is an integer 0–100 (or -1 if indeterminate).
-        The callback may be used by the ArcGIS Toolbox to update the
-        progressor label and display elapsed time.
     max_densify_points : int
         Maximum number of densified boundary points before adaptive
-        adjustment increases ``densify_distance`` automatically (Plan D).
+        adjustment increases ``densify_distance`` automatically.
         Default is 10,000.
 
     Returns
     -------
     str or None
-        WKT ``LINESTRING`` or ``MULTILINESTRING``, or None for degenerate
-        or empty input.
+        WKT ``MULTILINESTRING``, or None for degenerate or empty input.
     """
     polygons = _parse_wkt_polygon(wkt)
     if not polygons:
@@ -1107,8 +1191,6 @@ def polygon_to_centerline_wkt(
     if not all_results:
         return None
 
-    if single_line:
-        return _paths_to_wkt(all_results)
-
+    # Both single_line=True and single_line=False now return edge lists
     all_edges = [edge for result in all_results for edge in result]
     return _edges_to_multilinestring_wkt(all_edges)
