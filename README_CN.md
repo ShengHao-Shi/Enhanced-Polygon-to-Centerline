@@ -356,4 +356,4 @@ Enhanced-Polygon-to-Centerline/
 
 ## 许可证
 
-MIT License — 可自由使用、修改和分发。详见仓库根目录的 LICENSE 文件（如有）。
+MIT License — 可自由使用、修改和分发。详见仓库根目录的 LICENSE 文件。
