@@ -1,6 +1,7 @@
 # Enhanced Polygon to Centerline
 
 > **🌐 Language / 语言**:  [English](#enhanced-polygon-to-centerline) · [中文说明](README_CN.md)
+![Centerline demo](images/centerline_demo.png)
 
 An ArcGIS Python Toolbox that converts elongated polygon features (rivers,
 roads, channels, corridors) into clean, branching centerline polylines — using
