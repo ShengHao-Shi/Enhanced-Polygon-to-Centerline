@@ -385,5 +385,5 @@ the tiny narrow side tributaries are all cleaned up automatically.
 
 ## License
 
-MIT License — free to use, modify and distribute.  See [LICENSE](LICENSE) if present.
+MIT License — free to use, modify and distribute.  See [LICENSE](LICENSE) 
 
