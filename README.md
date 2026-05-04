@@ -368,11 +368,18 @@ Enhanced-Polygon-to-Centerline/
 
 ## Example Output
 
-![Centerline demo](https://github.com/user-attachments/assets/b360be4f-c1d0-4add-b5a0-dd552580c379)
+![Centerline demo](images/centerline_demo.png)
 
-*Example: degree-aware branching centerline extracted from a sinuous river
-polygon.  All meaningful tributary junctions are preserved; short noise spurs
-are automatically filtered.*
+**Left — Full Raw Skeleton** (`Return Full Raw Skeleton` checked): all Voronoi
+ridges inside the polygon are returned.  Short noise spurs are clearly visible
+at every obtuse bend and where the tiny narrow tributaries join the main
+channel.
+
+**Right — Pruned Centerline** (default): the degree-aware branch decomposition
+removes short terminal segments that are noise artefacts (< 10 % of the
+reference skeleton length), while preserving every real tributary junction.
+The small spurious branches at the kinks in the left arm, the right arm, and
+the tiny narrow side tributaries are all cleaned up automatically.
 
 ---
 
